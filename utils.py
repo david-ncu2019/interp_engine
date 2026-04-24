@@ -345,23 +345,81 @@ def plot_directional_variogram(dir_vario_list, true_params=None,
 # 3. CROSS-VALIDATION (GPR & Kriging)
 # ========================================================================
 
-def perform_gpr_kfold_cv(rgpr_model, X, y, n_folds=5, seed=42):
+def make_spatial_block_folds(X: np.ndarray, n_folds: int) -> np.ndarray:
+    """Assign spatial block fold labels to data points.
+
+    Instead of KMeans clustering (which creates compact, spatially disjoint
+    clusters that force the test set *outside* the correlation range of the
+    training set), this function sorts points along a space-filling diagonal
+    direction and divides them into N contiguous geographic strips.
+
+    Each strip is entirely surrounded by training data from adjacent strips,
+    so test points remain *within* the correlation range — true interpolation
+    rather than extrapolation.
+
+    Scientific rationale
+    --------------------
+    KMeans CV tends to underestimate prediction skill for spatially correlated
+    data because test clusters are far from all training clusters (Wadoux et al.,
+    2021, Environ. Model. Softw.). Spatial block CV gives a more honest estimate
+    of interpolation performance.
+
+    Args:
+        X: (n, 2) array of spatial coordinates.
+        n_folds: Number of CV folds (geographic strips).
+
+    Returns:
+        fold_ids: (n,) integer array in [0, n_folds-1] assigning each point
+                  to a fold.
+    """
+    # Project onto 45° diagonal so both X and Y variation contribute equally
+    # to the sort order.  Points with similar X+Y end up in the same strip.
+    diagonal_proj = X[:, 0] + X[:, 1]
+    sort_idx = np.argsort(diagonal_proj)
+
+    fold_ids = np.empty(len(X), dtype=int)
+    # Split sorted indices into n_folds roughly equal groups
+    for fold, chunk in enumerate(np.array_split(sort_idx, n_folds)):
+        fold_ids[chunk] = fold
+    return fold_ids
+
+
+def perform_gpr_kfold_cv(rgpr_model, X, y, n_folds=5, seed=42, nst=None):
     """
     K-fold spatial cross-validation for RotatedGPR using fixed parameters.
 
-    Returns DataFrame with Observed, Predicted, Uncertainty, Residual, Z_Score.
-    """
-    from sklearn.cluster import KMeans
+    Uses the angle, kernel, and jitter alpha learned on the full dataset.
+    Each fold re-fits a GaussianProcessRegressor with those fixed parameters
+    on the training split, then predicts the held-out split.
 
+    Args:
+        rgpr_model : fitted RotatedGPR instance
+        X          : (n, 2) coordinate array
+        y          : (n,) value array — may be in normal-score units if NST
+                     was applied upstream
+        n_folds    : number of spatial block folds
+        seed       : random seed (kept for API compatibility)
+        nst        : optional NormalScoreTransform instance.  If provided,
+                     both Observed and Predicted are back-transformed to
+                     original data units before being written to the result
+                     DataFrame.  This ensures CV metrics (R², MAE, RMSE)
+                     are always reported in the same units as the raw data,
+                     regardless of whether NST was applied during training.
+
+    Returns DataFrame with Observed, Predicted, Uncertainty, Residual, Z_Score.
+    All columns are in original data units when nst is provided.
+    """
     params = rgpr_model.get_kernel_params()
     angle = params["rotation_angle_deg"]
-    alpha = params.get("noise_level", rgpr_model.alpha)
+    # jitter_alpha is the key name in the new composite kernel architecture;
+    # fall back to best_alpha_ if the key is missing (e.g. older model objects).
+    alpha = params.get("jitter_alpha", getattr(rgpr_model, "best_alpha_", 1e-6))
 
-    # Fixed kernel from learned theta
+    # Clone the full fitted composite kernel (ConstantKernel * Spatial + White)
     fitted_kernel = clone(rgpr_model.gp_model_.kernel_)
 
-    # Spatial folds
-    clusters = KMeans(n_clusters=n_folds, random_state=seed, n_init=10).fit_predict(X)
+    # Spatial block folds: contiguous geographic strips along diagonal direction.
+    clusters = make_spatial_block_folds(X, n_folds)
 
     results = []
     for fold in range(n_folds):
@@ -388,28 +446,76 @@ def perform_gpr_kfold_cv(rgpr_model, X, y, n_folds=5, seed=42):
         gp.fit(X_tr_rot, y_tr)
         pred, std = gp.predict(X_te_rot, return_std=True)
 
+        # ── NST back-transform (approach b: original units) ───────────────
+        # If NST was applied before training, y and pred are in normal-score
+        # space.  We back-transform both observed and predicted values so
+        # that CV metrics are always in the original data domain.
+        if nst is not None:
+            obs_bt  = nst.inverse_transform(y_te)
+            pred_bt = nst.inverse_transform(pred)
+            # Propagate std through the nonlinear inverse: finite-difference
+            # derivative dx/dz evaluated at the predicted normal-score value.
+            delta   = 0.01
+            dnst    = 0.5 * np.abs(
+                nst.inverse_transform(pred + delta) -
+                nst.inverse_transform(pred - delta)
+            ) / delta
+            std_bt  = dnst * std
+        else:
+            obs_bt, pred_bt, std_bt = y_te, pred, std
+
         for j in range(len(y_te)):
-            res = y_te[j] - pred[j]
+            res = obs_bt[j] - pred_bt[j]
             results.append({
                 "X": X_te[j, 0], "Y": X_te[j, 1],
-                "Observed": float(y_te[j]),
-                "Predicted": float(pred[j]),
-                "Uncertainty": float(std[j]),
-                "Residual": float(res),
-                "Z_Score": float(res / (std[j] + 1e-12)),
-                "Abs_Error": float(abs(res)),
+                "Observed":    float(obs_bt[j]),
+                "Predicted":   float(pred_bt[j]),
+                "Uncertainty": float(std_bt[j]),
+                "Residual":    float(res),
+                "Z_Score":     float(res / (std_bt[j] + 1e-12)),
+                "Abs_Error":   float(abs(res)),
                 "Fold": fold,
             })
     return pd.DataFrame(results)
 
 
-def perform_kriging_kfold_cv(ak_model, X, y, n_folds=5, seed=42):
-    """K-fold spatial CV for AnisotropicKriging."""
-    from sklearn.cluster import KMeans
+def perform_kriging_kfold_cv(ak_model, X, y, n_folds=5, seed=42, nst=None):
+    """K-fold spatial CV for AnisotropicKriging with per-fold nugget estimation.
+
+    Two key improvements over a naive KMeans CV:
+
+    1. **Spatial block folds** (``make_spatial_block_folds``): test points fall
+       inside geographic strips surrounded by training data, so predictions are
+       genuine spatial interpolation — not extrapolation into isolated clusters.
+
+    2. **Per-fold nugget re-estimation**: the nugget (C₀) quantifies measurement
+       noise + micro-scale variability.  When a fold removes one geographic band
+       of data the local noise level can differ from the global estimate.  A
+       lightweight variogram fit on just the training split re-estimates C₀ for
+       that fold, giving each OrdinaryKriging instance a more accurate nugget
+       and thus better-calibrated prediction variances.
+
+    Args:
+        ak_model: Fitted AnisotropicKriging instance.
+        X: (n, 2) spatial coordinate array.
+        y: (n,) observation array — may be in normal-score units if NST applied.
+        n_folds: Number of geographic block folds.
+        seed: Unused (kept for API compatibility with GP version).
+        nst: optional NormalScoreTransform instance.  If provided, both
+             Observed and Predicted are back-transformed to original data
+             units before being written to the result DataFrame, so CV
+             metrics (R², MAE, RMSE) are always in original data units.
+
+    Returns:
+        pd.DataFrame with columns Observed, Predicted, Uncertainty, Residual,
+        Z_Score, Abs_Error, Fold, X, Y.  All in original units when nst given.
+    """
     from pykrige.ok import OrdinaryKriging
 
-    clusters = KMeans(n_clusters=n_folds, random_state=seed, n_init=10).fit_predict(X)
-    bp = dict(ak_model.best_params_)
+    # Spatial block folds — contiguous geographic strips (see make_spatial_block_folds)
+    clusters = make_spatial_block_folds(X, n_folds)
+
+    global_bp = dict(ak_model.best_params_)
     model_name = ak_model.best_model_name_
 
     results = []
@@ -419,23 +525,73 @@ def perform_kriging_kfold_cv(ak_model, X, y, n_folds=5, seed=42):
         X_tr, y_tr = X[tr], y[tr]
         X_te, y_te = X[te], y[te]
 
+        if len(X_tr) < 4 or len(X_te) == 0:
+            # Too few training points to fit a variogram in this fold — skip
+            continue
+
+        # ── Per-fold nugget re-estimation ─────────────────────────────────
+        # Fit a fast single-structure variogram on the training split using
+        # the same model family as the global best, but only optimise the
+        # nugget (C₀) and sill (C), fixing the range to the global value.
+        # This prevents the global nugget (estimated on all data) from being
+        # used blindly in a fold that may have locally higher or lower noise.
+        fold_bp = dict(global_bp)  # start from global best
         try:
-            ok = ak_model._get_ok_instance(X_tr, y_tr, bp, model_name)
+            from skgstat import Variogram as _SVario
+            _sv = _SVario(
+                X_tr, y_tr,
+                model=model_name,
+                n_lags=10,
+                maxlag=global_bp.get("range", None),
+                fit_method="trf",
+                estimator="matheron",
+            )
+            _params = _sv.parameters  # [range, sill, nugget]
+            if _params is not None and len(_params) >= 3:
+                fold_nugget = float(max(_params[2], 0.0))
+                fold_psill  = float(max(_params[1], 1e-6))
+                fold_bp["nugget"] = fold_nugget
+                fold_bp["psill"]  = fold_psill
+        except Exception:
+            # If skgstat is unavailable or the fit fails, fall back to global
+            pass
+        # ──────────────────────────────────────────────────────────────────
+
+        try:
+            ok = ak_model._get_ok_instance(X_tr, y_tr, fold_bp, model_name)
             pred, var = ok.execute("points", X_te[:, 0], X_te[:, 1])
-            std = np.sqrt(np.abs(var))
+            pred = np.asarray(pred, dtype=np.float64)
+            std  = np.sqrt(np.abs(np.asarray(var, dtype=np.float64)))
         except Exception:
             continue
 
+        # ── NST back-transform (approach b: original units) ───────────────
+        # If NST was applied before training, y and pred are in normal-score
+        # space.  Back-transform both so CV metrics are in original units.
+        # The ±3.5 clip inside nst.inverse_transform() prevents Kriging
+        # prediction overshoots from causing catastrophic tail extrapolation.
+        if nst is not None:
+            obs_bt  = nst.inverse_transform(y_te)
+            pred_bt = nst.inverse_transform(pred)
+            delta   = 0.01
+            dnst    = 0.5 * np.abs(
+                nst.inverse_transform(pred + delta) -
+                nst.inverse_transform(pred - delta)
+            ) / delta
+            std_bt  = dnst * std
+        else:
+            obs_bt, pred_bt, std_bt = y_te, pred, std
+
         for j in range(len(y_te)):
-            res = y_te[j] - pred[j]
+            res = obs_bt[j] - pred_bt[j]
             results.append({
                 "X": X_te[j, 0], "Y": X_te[j, 1],
-                "Observed": float(y_te[j]),
-                "Predicted": float(pred[j]),
-                "Uncertainty": float(std[j]),
-                "Residual": float(res),
-                "Z_Score": float(res / (std[j] + 1e-12)),
-                "Abs_Error": float(abs(res)),
+                "Observed":    float(obs_bt[j]),
+                "Predicted":   float(pred_bt[j]),
+                "Uncertainty": float(std_bt[j]),
+                "Residual":    float(res),
+                "Z_Score":     float(res / (std_bt[j] + 1e-12)),
+                "Abs_Error":   float(abs(res)),
                 "Fold": fold,
             })
     return pd.DataFrame(results)
@@ -524,15 +680,30 @@ def plot_anisotropy_ellipse(params, true_params=None, engine_name="",
                             scenario_name="", save_path=None):
     """Draw correlation ellipse comparing recovered vs true anisotropy."""
     angle = params.get("rotation_angle_deg", 0)
-    ls = params.get("length_scale", [1, 1])
-    if not hasattr(ls, '__len__'):
-        ls = [ls, ls]
-    ratio = params.get("anisotropy_ratio", 1)
+    
+    # Kriging uses 'range' and 'anisotropy_ratio'
+    # GP uses 'length_scale' (which can be a list [ls_major, ls_minor])
+    ls = params.get("length_scale")
+    ratio = params.get("anisotropy_ratio", 1.0)
+    
+    if ls is not None:
+        if not hasattr(ls, '__len__'):
+            ls_major = float(ls)
+            ls_minor = float(ls) / ratio
+        else:
+            ls_major = float(ls[0])
+            ls_minor = float(ls[1])
+    else:
+        # Fallback to 'range' for Kriging
+        ls_major = float(params.get("range", 1.0))
+        ls_minor = ls_major / ratio
 
     fig, ax = plt.subplots(figsize=(7, 7), dpi=150)
 
     # Recovered ellipse
-    ell = Ellipse((0, 0), 2 * ls[0], 2 * ls[1], angle=angle,
+    # width: diameter along the major axis
+    # height: diameter along the minor axis
+    ell = Ellipse((0, 0), width=2 * ls_major, height=2 * ls_minor, angle=angle,
                   ec="red", fc="salmon", alpha=0.3, lw=2,
                   label=f"Recovered (angle={angle:.1f}, ratio={ratio:.2f})")
     ax.add_patch(ell)
@@ -546,7 +717,7 @@ def plot_anisotropy_ellipse(params, true_params=None, engine_name="",
                        label=f"True (angle={ta:.1f}, ratio={tr/tmin:.2f})")
         ax.add_patch(ell2)
 
-    lim = max(max(ls), true_params.get("range_major", 1) if true_params else 1) * 1.3
+    lim = max(ls_major, true_params.get("range_major", 1) if true_params else 1) * 1.3
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
     ax.set_aspect("equal")

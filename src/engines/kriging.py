@@ -40,9 +40,15 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         'rational-quadratic': rational_quadratic_variogram_model
     }
 
+    # Minimum recommended trials: TPE needs ~25 random startup trials before it
+    # starts making informed suggestions.  With 9 categorical model choices, the
+    # effective search space is large enough that fewer than 100 trials gives
+    # unreliable results.
+    _MIN_TRIALS_RECOMMENDED = 100
+
     def __init__(
         self,
-        n_trials: int = 50,
+        n_trials: int = 150,
         n_splits: int = 5,
         verbose: bool = False,
         random_state: Optional[int] = None,
@@ -53,7 +59,7 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         self.verbose = verbose
         self.random_state = random_state
         self.max_anisotropy = max_anisotropy
-        
+
         self.model_ = None
         self.best_params_ = None
         self.best_model_name_ = None
@@ -90,7 +96,22 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
     def fit(self, X: np.ndarray, y: np.ndarray) -> 'AnisotropicKriging':
         if not self.verbose:
             optuna.logging.set_verbosity(optuna.logging.WARNING)
-        
+
+        # Guard: warn the user if n_trials is too low for reliable optimisation.
+        # The search space has 9 categorical model types + ~6 continuous params;
+        # TPE requires ~25 warm-up (random) trials before it can guide search.
+        if self.n_trials < self._MIN_TRIALS_RECOMMENDED:
+            import warnings
+            warnings.warn(
+                f"AnisotropicKriging: n_trials={self.n_trials} is below the "
+                f"recommended minimum of {self._MIN_TRIALS_RECOMMENDED}. "
+                f"The optimiser may not converge to a good solution. "
+                f"Consider setting n_trials >= {self._MIN_TRIALS_RECOMMENDED} "
+                f"in your config.yaml.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         X = np.asarray(X)
         y = np.asarray(y)
         
@@ -143,12 +164,17 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
 
         self.study_ = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=self.random_state))
         self.study_.optimize(objective, n_trials=self.n_trials)
-        
-        self.best_params_ = self.study_.best_params
-        self.best_model_name_ = self.best_params_.pop('model')
-        
+
+        # ── Extract best results without mutating the Optuna params dict ──────
+        # Previously `best_params_.pop('model')` permanently modified the dict,
+        # which caused fragile ordering dependency in downstream CV and reporting
+        # code.  We now copy the dict first, then extract model name separately.
+        _raw_best = self.study_.best_params          # original Optuna dict — untouched
+        self.best_model_name_ = _raw_best['model']   # store model name as its own attr
+        self.best_params_ = {k: v for k, v in _raw_best.items() if k != 'model'}
+
         self.model_ = self._get_ok_instance(X, y, self.best_params_, self.best_model_name_)
-        
+
         return self
 
     def predict(self, X: np.ndarray, return_std: bool = False):
