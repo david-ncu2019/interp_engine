@@ -1,0 +1,12 @@
+# Ignore all files
+*
+
+# Do not ignore directories (so Git can traverse them)
+!*/
+
+# Only include Python files
+!*.py
+
+# Also track config and documentation files
+!*.yaml
+!*.md

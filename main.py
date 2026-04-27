@@ -28,9 +28,9 @@ import numpy as np
 import pandas as pd
 import time
 
-from src.data_loader import load_input_data
+from src.data_loader import load_input_data, load_custom_prediction_points
 from src.geometry import generate_prediction_grid
-from src.exporter import export_to_netcdf
+from src.exporter import export_grid, _VALID_POINT_FORMATS
 from src.engines.gp import RotatedGPR
 from src.engines.kriging import AnisotropicKriging
 from src.preprocessor import TrendProcessor, analyze_trend, NormalScoreTransform
@@ -207,7 +207,9 @@ def check_and_clean_duplicates(
 # ── main pipeline ─────────────────────────────────────────────────────────
 
 def run_pipeline():
-    config_path = Path("config.yaml")
+    import sys
+    config_path_str = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
+    config_path = Path(config_path_str)
     if not config_path.exists():
         print(f"Error: {config_path} not found.")
         return
@@ -359,12 +361,29 @@ def run_pipeline():
         print(f"       → NST SKIPPED  (data is sufficiently Gaussian — no transform needed)")
 
     # ── 2. Geometry ───────────────────────────────────────────────────
-    print("[2/7] Building prediction grid (buffered convex hull) ...")
-    X_grid, Y_grid, mask, grid_shape, hull_verts = generate_prediction_grid(
-        X_coord, Y_coord, config
-    )
-    print(f"       Grid: {grid_shape[1]}x{grid_shape[0]}  |  "
-          f"Inside hull: {np.sum(mask)} pts")
+    pred_cfg = config.get("prediction_points")
+    is_point_mode = pred_cfg is not None
+    
+    if is_point_mode:
+        print("[2/7] Point Mode active: Loading custom prediction points...")
+        pts_file = pred_cfg.get("filepath")
+        cols = pred_cfg.get("columns", {})
+        col_x = cols.get("x") or "X"
+        col_y = cols.get("y") or "Y"
+        
+        X_out, Y_out, df_out = load_custom_prediction_points(pts_file, col_x, col_y)
+        print(f"       Loaded {len(X_out)} custom points.")
+        print(f"       Note: Assuming custom points share the same CRS as input data.")
+        
+        X_grid, Y_grid, mask, grid_shape, hull_verts = None, None, None, None, None
+        valid_points = np.column_stack((X_out, Y_out))
+    else:
+        print("[2/7] Building prediction grid (buffered convex hull) ...")
+        X_grid, Y_grid, mask, grid_shape, hull_verts = generate_prediction_grid(
+            X_coord, Y_coord, config
+        )
+        print(f"       Grid: {grid_shape[1]}x{grid_shape[0]}  |  "
+              f"Inside hull: {np.sum(mask)} pts")
 
     # ── 3. Ground truth visualisation (A_) ────────────────────────────
     print("[3/7] Ground truth visualisation ...")
@@ -468,13 +487,16 @@ def run_pipeline():
 
     save_parameter_summary(params, mode, out_dir)
 
-    # ── 6. Predict on grid ────────────────────────────────────────────
-    print("[6/7] Predicting over spatial grid ...")
-    pred_mean = np.full(grid_shape, np.nan)
-    pred_std = np.full(grid_shape, np.nan)
+    # ── 6. Predict ────────────────────────────────────────────
+    if is_point_mode:
+        print("[6/7] Predicting over custom points ...")
+    else:
+        print("[6/7] Predicting over spatial grid ...")
+        pred_mean = np.full(grid_shape, np.nan)
+        pred_std = np.full(grid_shape, np.nan)
 
-    grid_points = np.column_stack((X_grid.flatten(), Y_grid.flatten()))
-    valid_points = grid_points[mask]
+        grid_points = np.column_stack((X_grid.flatten(), Y_grid.flatten()))
+        valid_points = grid_points[mask]
 
     if len(valid_points) > 0:
         means, stds = model.predict(valid_points, return_std=True)
@@ -494,22 +516,28 @@ def run_pipeline():
             stds  = dnst * stds   # propagate std through the nonlinear transform
         if processor is not None:
             means = processor.retrend(valid_points[:, 0], valid_points[:, 1], means)
-        pred_mean.flat[mask] = means
-        pred_std.flat[mask] = stds
+            
+        if is_point_mode:
+            point_pred_mean = means
+            point_pred_std = stds
+        else:
+            pred_mean.flat[mask] = means
+            pred_std.flat[mask] = stds
 
     # ── 7. Diagnostics & export ───────────────────────────────────────
     print("[7/7] Generating outputs ...")
 
     # B_ Convex hull
-    plot_convex_hull(
-        X_coord, Y_coord, Z_val,
-        hull_verts, X_grid, Y_grid, mask,
-        scenario_name=scenario_name,
-        save_path=out_dir / "B_convex_hull.png",
-    )
-    print("       ✓ B_convex_hull.png")
+    if not is_point_mode:
+        plot_convex_hull(
+            X_coord, Y_coord, Z_val,
+            hull_verts, X_grid, Y_grid, mask,
+            scenario_name=scenario_name,
+            save_path=out_dir / "B_convex_hull.png",
+        )
+        print("       ✓ B_convex_hull.png")
 
-    if processor is not None and out_cfg.get("save_diagnostics", True):
+    if processor is not None and out_cfg.get("save_diagnostics", True) and not is_point_mode:
         plot_trend_components(
             X_coord, Y_coord, Z_val, Z_fit, processor,
             X_grid, Y_grid, mask, hull_verts,
@@ -549,28 +577,29 @@ def run_pipeline():
         )
         print(f"       ✓ F_anisotropy_ellipse_{mode}.png")
 
-    # G_ Prediction surface
-    plot_prediction_surface(
-        X_grid, Y_grid, pred_mean, pred_std,
-        X_obs=X_coord, Y_obs=Y_coord,
-        hull_vertices=hull_verts,
-        scenario_name=scenario_name,
-        engine_name=mode.upper(),
-        save_path=out_dir / f"G_prediction_surface_{mode}.png",
-    )
-    print(f"       ✓ G_prediction_surface_{mode}.png")
-
-    # H_ Comparison (only if ground truth available)
-    if gt is not None:
-        plot_comparison(
-            X_grid, Y_grid, pred_mean,
-            gt_X, gt_Y, gt_Z,
+    if not is_point_mode:
+        # G_ Prediction surface
+        plot_prediction_surface(
+            X_grid, Y_grid, pred_mean, pred_std,
+            X_obs=X_coord, Y_obs=Y_coord,
             hull_vertices=hull_verts,
             scenario_name=scenario_name,
             engine_name=mode.upper(),
-            save_path=out_dir / f"H_comparison_{mode}.png",
+            save_path=out_dir / f"G_prediction_surface_{mode}.png",
         )
-        print(f"       ✓ H_comparison_{mode}.png")
+        print(f"       ✓ G_prediction_surface_{mode}.png")
+
+        # H_ Comparison (only if ground truth available)
+        if gt is not None:
+            plot_comparison(
+                X_grid, Y_grid, pred_mean,
+                gt_X, gt_Y, gt_Z,
+                hull_vertices=hull_verts,
+                scenario_name=scenario_name,
+                engine_name=mode.upper(),
+                save_path=out_dir / f"H_comparison_{mode}.png",
+            )
+            print(f"       ✓ H_comparison_{mode}.png")
 
     # I_ Cross-validation dashboard
     if out_cfg.get("save_diagnostics", True):
@@ -664,15 +693,41 @@ def run_pipeline():
             else:
                 print(f"       ↑ Gap to ceiling: {gap:.4f} — consider data density / model selection.")
 
-    # NetCDF
-    z_dim = out_cfg.get("netcdf_z_dim_name", "Depth")
-    export_to_netcdf(
-        X_grid, Y_grid, pred_mean, pred_std,
-        output_dir=out_dir,
-        engine_name=mode,
-        z_dim_name=z_dim,
-    )
-    print("       ✓ predicted_{}.nc".format(mode))
+    # Export
+    requested_formats = out_cfg.get("formats", None)
+
+    if is_point_mode:
+        df_out['Predicted_Mean'] = point_pred_mean
+        df_out['Predicted_Std'] = point_pred_std
+
+        point_formats = requested_formats if requested_formats is not None else ["csv", "xz"]
+
+        unknown_pt = set(point_formats) - _VALID_POINT_FORMATS
+        if unknown_pt:
+            raise ValueError(
+                f"Unknown point-mode export format(s): {sorted(unknown_pt)}. "
+                f"Valid options are: {sorted(_VALID_POINT_FORMATS)}"
+            )
+
+        if "csv" in point_formats:
+            csv_path = out_dir / f"predicted_points_{mode}.csv"
+            df_out.to_csv(csv_path, index=False)
+            print(f"       ✓ predicted_points_{mode}.csv")
+
+        if "xz" in point_formats:
+            xz_path = out_dir / f"predicted_points_{mode}.xz"
+            df_out.to_pickle(xz_path)
+            print(f"       ✓ predicted_points_{mode}.xz")
+    else:
+        grid_formats = requested_formats if requested_formats is not None else ["nc"]
+        z_dim = out_cfg.get("netcdf_z_dim_name", "Depth")
+        export_grid(
+            grid_formats,
+            X_grid, Y_grid, pred_mean, pred_std,
+            output_dir=out_dir,
+            engine_name=mode,
+            z_dim_name=z_dim,
+        )
 
     # Parameters (already saved earlier, just confirm)
     print(f"       ✓ parameters_{mode}.txt")

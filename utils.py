@@ -314,7 +314,7 @@ def plot_directional_variogram(dir_vario_list, true_params=None,
                                scenario_name="", save_path=None):
     """Plot directional variograms on a single figure."""
     fig, ax = plt.subplots(figsize=(10, 6))
-    cmap = plt.cm.tab10
+    cmap = plt.cm.tab20
 
     for i, vd in enumerate(dir_vario_list):
         valid = vd["n_pairs"] > 0

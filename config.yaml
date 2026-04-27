@@ -1,0 +1,112 @@
+# ==============================================================================
+# Interpolation Engine Configuration
+# ==============================================================================
+
+input:
+  # Path to the input training data file. 
+  # Supported formats: .csv, .xlsx, .shp (Shapefile requires geopandas)
+  filepath: test_data_2/input_dem.shp
+  
+  # Format of the input file ('csv', 'excel', 'shapefile').
+  # If left empty, it will be auto-detected from the file extension.
+  format: "" 
+  
+  # Specify the exact column names in your data that correspond to the coordinates 
+  # and the value you want to interpolate.
+  # Note: If using a Shapefile, 'x' and 'y' are optional and will be auto-detected 
+  # from the geometry column if not found.
+  columns:
+    x:
+    y:
+    value: grid_code
+    
+  # (Optional) Path to a ground truth dataset for comparison plots. Set to null to disable.
+  ground_truth_filepath: null
+
+# ------------------------------------------------------------------------------
+# Prediction Points (Optional)
+# ------------------------------------------------------------------------------
+# If you want to predict at specific locations rather than on a generated grid,
+# uncomment and fill out the section below.
+# Note: The custom points MUST be in the same Coordinate Reference System (CRS) 
+# as the input data. Supported formats: .csv, .xlsx, .shp
+#
+# If a Shapefile is provided, 'x' and 'y' are optional and will be auto-detected.
+# The predicted points will be exported as both a .csv and a .xz file (a compressed 
+# pickle file that preserves the Geopandas DataFrame, including original geometries).
+#
+prediction_points:
+  filepath: test_data_2/output_points.shp
+  columns:
+    x:
+    y:
+
+# ------------------------------------------------------------------------------
+# Geometry (Used ONLY if prediction_points is NOT defined)
+# ------------------------------------------------------------------------------
+geometry:
+  # The spatial resolution of the prediction grid (in the same units as your CRS).
+  resolution_m: 50.0
+  # How much to buffer the convex hull of the input data (percentage).
+  convex_hull_buffer_percent: 10.0
+
+# ------------------------------------------------------------------------------
+# Preprocessing
+# ------------------------------------------------------------------------------
+preprocessing:
+  detrend:
+    # Auto-detect whether a polynomial trend exists and subtract it before modeling.
+    auto_detect: true
+    # If auto_detect is false, force detrending on/off using this flag.
+    enabled: true
+    # The order of the polynomial surface to fit (1 = linear, 2 = quadratic).
+    order: 1
+  nst:
+    # Normal-Score Transform. Set to true/false to force, or null to auto-detect.
+    enabled: null
+  duplicates:
+    # Minimum separation distance between points. Points closer than this are jittered
+    # or merged to avoid singular matrices. Null means auto-calculate.
+    min_separation: null
+
+# ------------------------------------------------------------------------------
+# Engine Configuration
+# ------------------------------------------------------------------------------
+engine:
+  # The interpolation algorithm to use: 'kriging' or 'gp' (Gaussian Process)
+  mode: kriging
+  
+  kriging:
+    # Maximum allowed anisotropy ratio for the spatial variogram.
+    max_anisotropy: 10.0
+    # Number of cross-validation splits for hyperparameter tuning.
+    n_splits: 5
+    # Number of Optuna trials for finding the best variogram parameters.
+    n_trials: 100
+    
+  gp:
+    # Angle bounds for the anisotropy ellipse search (in degrees).
+    angle_min: 0.0
+    angle_max: 180.0
+    max_anisotropy: 15.0
+    n_optuna_trials: 300
+    random_state: 42
+
+# ------------------------------------------------------------------------------
+# Output Configuration
+# ------------------------------------------------------------------------------
+output:
+  # The directory where all plots and data files will be saved.
+  base_directory: output_2
+  # The Z-dimension name for the NetCDF export (used by Paraview, etc.)
+  netcdf_z_dim_name: elev
+  # Whether to generate and save diagnostic plots (variograms, CV dashboards, etc.)
+  save_diagnostics: true
+  # Output formats to export. All listed formats will be produced in a single run.
+  # Grid mode supports : nc, tif, csv
+  # Point mode supports: csv, xz
+  # Omit this key to use the default (nc for grid mode; csv + xz for point mode).
+  formats:
+    # - nc
+    # - tif
+    - csv
