@@ -32,7 +32,10 @@ engine:
 Run:
 
 ```bash
-python main.py config.yaml
+python main.py config.yaml           # normal output
+python main.py config.yaml --verbose # show Optuna trials and post-fit details
+python main.py config.yaml --quiet   # warnings and errors only
+python main.py --help                # see all options
 ```
 
 Results — predictions, cross-validation metrics, and diagnostic plots — land in
@@ -45,15 +48,22 @@ Results — predictions, cross-validation metrics, and diagnostic plots — land
 - **Two interpolation backends** — ordinary kriging (9 variogram models via PyKrige)
   or Gaussian process (Matérn-3/2, Matérn-5/2, RBF kernels via scikit-learn)
 - **Automatic hyperparameter tuning** — Optuna TPE sampler with spatial KMeans
-  cross-validation, not random splits (prevents information leakage)
+  cross-validation, not random splits (prevents information leakage); supports
+  parallel trials via `n_jobs` for multi-core speedup
+- **Structured logging** — Python `logging` module with `--verbose` / `--quiet` CLI
+  flags; progress bars via `tqdm` for Optuna trials, angle scans, and CV folds
 - **Normal-Score Transform** — rank-preserving Gaussian anamorphosis with
   auto-detection (Shapiro-Wilk + skewness + kurtosis thresholds)
 - **Polynomial trend detection** — F-test and Moran's I decide when to detrend;
   subtracts the trend before modelling and re-adds it after prediction
+- **Input validation** — five pre-flight checks catch bad data (NaN, constant
+  values, colinear points, too few samples) before Optuna ever fires
 - **Duplicate handling** — exact duplicates averaged, near-duplicates jittered
   with adaptive separation thresholds
 - **Anisotropy search** — two-pass strategy: coarse angle scan followed by Optuna
   refinement and L-BFGS-B local polish
+- **Fast-path API** — `fit_with_known_params()` on both engines skips Optuna when
+  you already have good parameters (CI, repeated runs, parameter sharing)
 - **Smart prediction grid** — ConvexHull-bounded grid generation with configurable
   buffer; also supports prediction at arbitrary point locations
 - **Multi-format export** — NetCDF (CF-compliant), GeoTIFF, CSV, and compressed
@@ -73,7 +83,7 @@ config.yaml ──► data_loader ──► preprocessor ──► engine ──
 
 | Module | Role |
 |--------|------|
-| [`main.py`](main.py) | Pipeline orchestrator: config → load → preprocess → fit → predict → export |
+| [`main.py`](main.py) | Pipeline orchestrator with 7 decomposed stages: load → preprocess → geometry → engine → fit → predict → export |
 | [`src/engines/kriging.py`](src/engines/kriging.py) | Anisotropic ordinary kriging with Optuna variogram selection |
 | [`src/engines/gp.py`](src/engines/gp.py) | Anisotropic Gaussian Process with kernel selection |
 | [`src/preprocessor.py`](src/preprocessor.py) | TrendProcessor, NormalScoreTransform, normality checks |
@@ -117,10 +127,11 @@ recommendations.
 python test_engine.py
 ```
 
-20 tests, 66+ assertions. Parameter caching avoids re-running Optuna on every
-invocation — ~4 minutes with cache populated, ~15 minutes without. 14 synthetic
-datasets cover isotropic through extreme-anisotropy regimes plus edge cases
-(duplicates, colinearity, log-normal, strong trend, few points).
+26 tests, 97 assertions covering both kriging and GP backends. Parameter caching
+avoids re-running Optuna on every invocation — ~50 seconds with cache populated,
+~15 minutes without. 14 synthetic datasets cover isotropic through
+extreme-anisotropy regimes plus edge cases (duplicates, colinearity, log-normal,
+strong trend, few points).
 
 ---
 
