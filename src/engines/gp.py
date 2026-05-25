@@ -293,10 +293,11 @@ class RotatedGPR(BaseEstimator, RegressorMixin):
         self.X_train_ = np.asarray(X, dtype=np.float64)
         self.y_train_ = np.asarray(y, dtype=np.float64)
 
-        if self.X_train_.shape[1] != 2:
-            raise ValueError(
-                f"X must have exactly 2 columns, got {self.X_train_.shape[1]}"
-            )
+        from src.validation import validate_2d_coordinates, validate_not_constant, validate_finite, validate_shape_match
+        validate_finite(self.X_train_, self.y_train_)
+        validate_shape_match(self.X_train_, self.y_train_)
+        validate_2d_coordinates(self.X_train_)
+        validate_not_constant(self.y_train_)
 
         if self.center_coords:
             self.X_train_centered_, self.X_center_ = \

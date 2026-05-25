@@ -56,7 +56,14 @@ def load_input_data(config: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         
     # Drop NaNs
     df = df.dropna(subset=[col_x, col_y, col_val])
-    
+
+    if len(df) == 0:
+        raise ValueError(
+            f"Input file '{filepath}' contains no valid data after removing "
+            f"rows with missing values in columns {col_x}, {col_y}, {col_val}. "
+            f"Please check that the file is not empty and that column names match."
+        )
+
     return df[col_x].values.astype(np.float64), df[col_y].values.astype(np.float64), df[col_val].values.astype(np.float64)
 
 

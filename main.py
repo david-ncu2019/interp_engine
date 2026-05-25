@@ -231,6 +231,13 @@ def run_pipeline():
     X = np.column_stack((X_coord, Y_coord))
     print(f"       {len(Z_val)} sample points loaded.")
 
+    # Guard: spatial interpolation requires a minimum number of points.
+    if len(Z_val) < 5:
+        raise ValueError(
+            f"Only {len(Z_val)} data point(s) loaded. At least 5 are required "
+            f"for variogram fitting and kriging. Please provide a larger dataset."
+        )
+
     # ── 1.1. Duplicate / near-duplicate coordinate guard ──────────────
     # Two samples at (or very near) the same location will make the
     # covariance matrix singular and cause a crash or silent failure.
@@ -247,6 +254,16 @@ def run_pipeline():
 
     X, Z_val, dup_report = check_and_clean_duplicates(X, Z_val, min_separation=min_sep)
     X_coord, Y_coord = X[:, 0], X[:, 1]
+
+    # Guard: duplicate merging can reduce the dataset below the viable minimum.
+    if len(Z_val) < 3:
+        raise ValueError(
+            f"After duplicate removal, only {len(Z_val)} unique point(s) remain. "
+            f"At least 3 spatially distinct points are required for any "
+            f"kriging or GP model. The original data had "
+            f"{dup_report['n_original']} points, of which "
+            f"{dup_report['n_exact']} were exact duplicates."
+        )
 
     if dup_report["n_exact"] > 0 or dup_report["n_near"] > 0:
         print(f"  ⚠  Duplicate guard: {dup_report['n_exact']} exact duplicates merged, "
@@ -488,6 +505,9 @@ def run_pipeline():
     save_parameter_summary(params, mode, out_dir)
 
     # ── 6. Predict ────────────────────────────────────────────
+    point_pred_mean = None
+    point_pred_std = None
+
     if is_point_mode:
         print("[6/7] Predicting over custom points ...")
     else:
@@ -697,6 +717,11 @@ def run_pipeline():
     requested_formats = out_cfg.get("formats", None)
 
     if is_point_mode:
+        if len(valid_points) == 0:
+            raise RuntimeError(
+                "No valid prediction points to export. This can happen if all "
+                "custom prediction points lie outside the data envelope."
+            )
         df_out['Predicted_Mean'] = point_pred_mean
         df_out['Predicted_Std'] = point_pred_std
 

@@ -110,10 +110,11 @@ print(f"  Samples: {len(df9)}, Ground truth: {len(df9_gt)}")
 # S10: Data with exact and near-duplicate coordinates
 # ═══════════════════════════════════════════════════════════════════════════
 print("S10: Duplicate coordinates")
-X10 = np.array([100, 200, 300, 400, 500, 600, 700, 800, 900, 300, 301, 302,
+# Scattered unique points (not colinear) + duplicates
+X10 = np.array([100, 200, 300, 400, 500, 600, 700, 800, 900, 310, 320, 330,
                 100, 100, 200, 200, 300, 300, 400, 400], dtype=float)
-Y10 = np.array([100, 200, 300, 400, 500, 600, 700, 800, 900, 300, 301, 302,
-                100, 100, 200, 200, 300, 300, 400, 400], dtype=float)
+Y10 = np.array([150, 350, 250, 550, 450, 750, 650, 950, 850, 260, 270, 280,
+                150, 150, 350, 350, 250, 250, 550, 550], dtype=float)
 # Generate from a clean field, then overwrite with conflicting values at duplicates
 sample_xy10 = np.column_stack([X10, Y10])
 grid_xy10 = dense_grid(0, 1000, 0, 1000, 80, 80)
@@ -125,10 +126,10 @@ df10, df10_gt = make_paired_dataset(
 # Overwrite duplicate-group values with deliberately conflicting values
 # This simulates measurement error at co-located points
 z_clean = df10["Value"].values.copy()
-z_clean[12] = z_clean[13] + 3.0   # (100,100) second copy: +3 offset
-z_clean[14] = z_clean[15] + 3.0   # (200,200) second copy
-z_clean[16] = z_clean[17] + 3.0   # (300,300) second copy
-z_clean[18] = z_clean[19] + 3.0   # (400,400) second copy
+z_clean[12] = z_clean[13] + 3.0   # (100,150) second copy: +3 offset
+z_clean[14] = z_clean[15] + 3.0   # (200,350) second copy
+z_clean[16] = z_clean[17] + 3.0   # (300,250) second copy
+z_clean[18] = z_clean[19] + 3.0   # (400,550) second copy
 df10["Value"] = z_clean
 df10.to_csv(OUT_DIR / "S10_Duplicates.csv", index=False)
 df10_gt.to_csv(OUT_DIR / "S10_Duplicates_ground_truth.csv", index=False)

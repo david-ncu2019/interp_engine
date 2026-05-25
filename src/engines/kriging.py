@@ -9,6 +9,14 @@ from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.cluster import KMeans
 import optuna
 
+from src.validation import (
+    validate_finite,
+    validate_min_samples,
+    validate_not_constant,
+    validate_2d_coordinates,
+    validate_shape_match,
+)
+
 def stable_variogram_model(params, dists):
     psill, r, nugget, alpha = params
     return psill * (1.0 - np.exp(-(dists / r) ** alpha)) + nugget
@@ -55,6 +63,20 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         max_anisotropy: float = 3.0,
         n_jobs: int = 1
     ):
+        if max_anisotropy < 1.0:
+            raise ValueError(
+                f"max_anisotropy must be >= 1.0, got {max_anisotropy}. "
+                f"An anisotropy ratio < 1 would invert the major/minor axis."
+            )
+        if n_splits < 2:
+            raise ValueError(
+                f"n_splits must be >= 2 for cross-validation, got {n_splits}."
+            )
+        if n_trials < 1:
+            raise ValueError(
+                f"n_trials must be >= 1, got {n_trials}."
+            )
+
         self.n_trials = n_trials
         self.n_splits = n_splits
         self.verbose = verbose
@@ -96,6 +118,16 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         return OrdinaryKriging(X[:, 0], X[:, 1], y, **kwargs)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> 'AnisotropicKriging':
+        # ── Input validation ──────────────────────────────────────────────
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        validate_finite(X, y)
+        validate_shape_match(X, y)
+        validate_2d_coordinates(X)
+        validate_not_constant(y)
+        # Require at least n_splits+2 points so each fold has ≥2 training points
+        validate_min_samples(X, y, min_samples=max(self.n_splits + 2, 5))
+
         # Suppress Optuna's default logger to reduce clutter
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -109,13 +141,10 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
                 stacklevel=2,
             )
 
-        X = np.asarray(X)
-        y = np.asarray(y)
-        
         clusters = KMeans(
             n_clusters=self.n_splits, random_state=self.random_state, n_init=10
         ).fit_predict(X)
-        
+
         data_var   = float(np.var(y))
         max_dist   = float(np.sqrt((X[:, 0].max() - X[:, 0].min())**2 +
                                    (X[:, 1].max() - X[:, 1].min())**2))
@@ -179,34 +208,82 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
 
         self.study_.optimize(objective, n_trials=self.n_trials, callbacks=[logging_callback], n_jobs=self.n_jobs)
 
+        # ── Guard: study may have zero successful trials ───────────────────
+        if len(self.study_.trials) == 0 or all(
+            t.value is None or not np.isfinite(t.value)
+            for t in self.study_.trials
+        ):
+            raise RuntimeError(
+                "Kriging optimisation failed: no trial produced a finite CV score. "
+                "This usually means the data is too sparse, too noisy, or has "
+                "degenerate geometry (e.g. all points colinear). "
+                "Try: (1) increasing n_trials, (2) checking for duplicate/colinear "
+                "coordinates, or (3) using a simpler interpolation method."
+            )
+
         # ── Extract best results without mutating the Optuna params dict ──────
-        # Previously `best_params_.pop('model')` permanently modified the dict,
-        # which caused fragile ordering dependency in downstream CV and reporting
-        # code.  We now copy the dict first, then extract model name separately.
         _raw_best = self.study_.best_params          # original Optuna dict — untouched
         self.best_model_name_ = _raw_best['model']   # store model name as its own attr
         self.best_params_ = {k: v for k, v in _raw_best.items() if k != 'model'}
 
-        self.model_ = self._get_ok_instance(X, y, self.best_params_, self.best_model_name_)
+        # ── Final model fit ─────────────────────────────────────────────────
+        try:
+            self.model_ = self._get_ok_instance(
+                X, y, self.best_params_, self.best_model_name_
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to build the final kriging system with the optimised "
+                f"parameters. The covariance matrix is likely singular due to "
+                f"near-duplicate points or extreme anisotropy. "
+                f"Underlying error: {type(e).__name__}: {e}"
+            ) from e
 
         return self
 
     def fit_with_known_params(self, X: np.ndarray, y: np.ndarray, best_model_name: str, best_params: dict) -> 'AnisotropicKriging':
         """Fit the model instantly using pre-computed optimal parameters (skips Optuna search)."""
-        X = np.asarray(X)
-        y = np.asarray(y)
-        
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        validate_finite(X, y)
+        validate_shape_match(X, y)
+        validate_2d_coordinates(X)
+        validate_not_constant(y)
+
         self.best_model_name_ = best_model_name
         self.best_params_ = best_params
-        
-        # Instantiate OrdinaryKriging directly with the known parameters
-        self.model_ = self._get_ok_instance(X, y, self.best_params_, self.best_model_name_)
-        
+
+        try:
+            self.model_ = self._get_ok_instance(X, y, self.best_params_, self.best_model_name_)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to build kriging system with provided parameters. "
+                f"The covariance matrix may be singular. "
+                f"Underlying error: {type(e).__name__}: {e}"
+            ) from e
+
         return self
 
     def predict(self, X: np.ndarray, return_std: bool = False):
-        X = np.asarray(X)
+        X = np.asarray(X, dtype=np.float64)
+        validate_finite(X, name="prediction coordinates")
+        if self.model_ is None:
+            raise RuntimeError(
+                "Model has not been fitted. Call fit() or fit_with_known_params() "
+                "before predict()."
+            )
         y_pred, y_var = self.model_.execute('points', X[:, 0], X[:, 1])
+        # Guard against numerical garbage from PyKrige on out-of-domain points
+        if not np.all(np.isfinite(y_pred)):
+            import warnings
+            n_bad = int((~np.isfinite(y_pred)).sum())
+            warnings.warn(
+                f"{n_bad} prediction(s) are non-finite (NaN/Inf). "
+                f"This can happen when predicting far outside the data envelope. "
+                f"Consider clipping prediction coordinates to the convex hull."
+            )
+            y_pred = np.nan_to_num(y_pred, nan=np.nanmean(y_pred), posinf=np.nanmax(y_pred[np.isfinite(y_pred)]), neginf=np.nanmin(y_pred[np.isfinite(y_pred)]))
+            y_var = np.nan_to_num(y_var, nan=0.0, posinf=0.0, neginf=0.0)
         if return_std:
             return y_pred, np.sqrt(np.abs(y_var))
         return y_pred

@@ -46,10 +46,24 @@ def generate_prediction_grid(X: np.ndarray, Y: np.ndarray, config: dict):
     X_grid, Y_grid = np.meshgrid(x_vec, y_vec)
     grid_shape = X_grid.shape
 
-    # 4. Convex Hull
+    # 4. Convex Hull — with fallback for degenerate (colinear) point sets
     points = np.column_stack((X, Y))
-    hull = ConvexHull(points)
-    hull_verts = points[hull.vertices]
+    try:
+        hull = ConvexHull(points)
+        hull_verts = points[hull.vertices]
+    except Exception:
+        import warnings
+        warnings.warn(
+            "ConvexHull failed (points may be colinear or degenerate). "
+            "Falling back to a bounding-box prediction grid."
+        )
+        # Bounding-box fallback: use the buffered extent directly
+        hull_verts = np.array([
+            [x_min, y_min],
+            [x_max, y_min],
+            [x_max, y_max],
+            [x_min, y_max],
+        ])
 
     # Expand hull outward from centroid by buffer_pct
     centroid = np.mean(hull_verts, axis=0)

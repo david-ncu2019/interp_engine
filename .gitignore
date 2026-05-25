@@ -10,3 +10,11 @@
 # Also track config and documentation files
 !*.yaml
 !*.md
+
+# Allow test data and parameter files
+!*.csv
+!*.json
+
+# Re-ignore generated output and settings files
+comparison_summary.csv
+.claude/
