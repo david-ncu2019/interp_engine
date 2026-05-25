@@ -1,0 +1,36 @@
+input:
+  filepath: test_data/S12_LogNormal.csv
+  format: csv
+  columns:
+    x: X
+    y: Y
+    value: Value
+  ground_truth_filepath: test_data/S12_LogNormal_ground_truth.csv
+
+geometry:
+  resolution_m: 20.0
+  convex_hull_buffer_percent: 15.0
+
+preprocessing:
+  detrend:
+    auto_detect: true
+    enabled: true
+    order: 1
+  nst:
+    enabled: null
+  duplicates:
+    min_separation: null
+
+engine:
+  mode: kriging
+  kriging:
+    max_anisotropy: 3.0
+    n_splits: 3
+    n_trials: 150
+
+output:
+  base_directory: output
+  netcdf_z_dim_name: elev
+  save_diagnostics: true
+  formats:
+    - csv

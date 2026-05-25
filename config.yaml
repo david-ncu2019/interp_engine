@@ -74,15 +74,15 @@ preprocessing:
 # ------------------------------------------------------------------------------
 engine:
   # The interpolation algorithm to use: 'kriging' or 'gp' (Gaussian Process)
-  mode: kriging
+  mode: gp
   
   kriging:
     # Maximum allowed anisotropy ratio for the spatial variogram.
     max_anisotropy: 10.0
     # Number of cross-validation splits for hyperparameter tuning.
-    n_splits: 5
+    n_splits: 3
     # Number of Optuna trials for finding the best variogram parameters.
-    n_trials: 100
+    n_trials: 300
     
   gp:
     # Angle bounds for the anisotropy ellipse search (in degrees).

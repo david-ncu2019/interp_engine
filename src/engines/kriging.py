@@ -52,13 +52,15 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         n_splits: int = 5,
         verbose: bool = False,
         random_state: Optional[int] = None,
-        max_anisotropy: float = 3.0
+        max_anisotropy: float = 3.0,
+        n_jobs: int = 1
     ):
         self.n_trials = n_trials
         self.n_splits = n_splits
         self.verbose = verbose
         self.random_state = random_state
         self.max_anisotropy = max_anisotropy
+        self.n_jobs = n_jobs
 
         self.model_ = None
         self.best_params_ = None
@@ -94,20 +96,15 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         return OrdinaryKriging(X[:, 0], X[:, 1], y, **kwargs)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> 'AnisotropicKriging':
-        if not self.verbose:
-            optuna.logging.set_verbosity(optuna.logging.WARNING)
+        # Suppress Optuna's default logger to reduce clutter
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
 
         # Guard: warn the user if n_trials is too low for reliable optimisation.
-        # The search space has 9 categorical model types + ~6 continuous params;
-        # TPE requires ~25 warm-up (random) trials before it can guide search.
         if self.n_trials < self._MIN_TRIALS_RECOMMENDED:
             import warnings
             warnings.warn(
                 f"AnisotropicKriging: n_trials={self.n_trials} is below the "
-                f"recommended minimum of {self._MIN_TRIALS_RECOMMENDED}. "
-                f"The optimiser may not converge to a good solution. "
-                f"Consider setting n_trials >= {self._MIN_TRIALS_RECOMMENDED} "
-                f"in your config.yaml.",
+                f"recommended minimum of {self._MIN_TRIALS_RECOMMENDED}.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -158,12 +155,29 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
                     mse = float(np.mean((y[val_idx] - y_pred) ** 2))
                     scores.append(mse)
                 except Exception:
+                    # 'inf' occurs if the Kriging system is singular or numerically unstable
                     return float('inf')
             
             return np.mean(scores) if scores else float('inf')
 
-        self.study_ = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=self.random_state))
-        self.study_.optimize(objective, n_trials=self.n_trials)
+        self.study_ = optuna.create_study(
+            direction='minimize', 
+            sampler=optuna.samplers.TPESampler(seed=self.random_state)
+        )
+
+        def logging_callback(study, trial):
+            if self.verbose:
+                val = trial.value
+                val_str = f"{val:.2e}" if val != float('inf') else "inf"
+                best_val = f"{study.best_value:.2e}"
+                
+                # Format parameters with reduced precision
+                p = trial.params
+                p_str = f"model={p['model']}, psill={p['psill']:.2e}, range={p['range']:.1f}, nugget={p['nugget']:.2e}"
+                
+                print(f"  [Trial {trial.number}] val={val_str}, best={best_val} | {p_str}", flush=True)
+
+        self.study_.optimize(objective, n_trials=self.n_trials, callbacks=[logging_callback], n_jobs=self.n_jobs)
 
         # ── Extract best results without mutating the Optuna params dict ──────
         # Previously `best_params_.pop('model')` permanently modified the dict,
@@ -175,6 +189,19 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
 
         self.model_ = self._get_ok_instance(X, y, self.best_params_, self.best_model_name_)
 
+        return self
+
+    def fit_with_known_params(self, X: np.ndarray, y: np.ndarray, best_model_name: str, best_params: dict) -> 'AnisotropicKriging':
+        """Fit the model instantly using pre-computed optimal parameters (skips Optuna search)."""
+        X = np.asarray(X)
+        y = np.asarray(y)
+        
+        self.best_model_name_ = best_model_name
+        self.best_params_ = best_params
+        
+        # Instantiate OrdinaryKriging directly with the known parameters
+        self.model_ = self._get_ok_instance(X, y, self.best_params_, self.best_model_name_)
+        
         return self
 
     def predict(self, X: np.ndarray, return_std: bool = False):
