@@ -17,7 +17,9 @@ grounded in the actual source code.
 5. [engine](#5-engine)
    - 5.1 [Kriging parameters](#51-kriging-parameters)
    - 5.2 [GP parameters](#52-gp-gaussian-process-parameters)
-6. [output](#6-output)
+6. [input validation](#6-input-validation)
+7. [output](#7-output)
+8. [parameter choices by scenario](#8-parameter-choices-by-scenario)
 
 ---
 
@@ -77,6 +79,8 @@ geometry:
 |-----------|-------------|
 | `resolution_m` | Cell size of the prediction grid, in the same units as your coordinates (usually metres). Smaller = finer grid = slower prediction. A good starting value is 1/50 of the study area width. |
 | `convex_hull_buffer_percent` | How much to expand the prediction grid beyond the outermost sample points. 10 means the grid extends 10% of the hull's bounding box beyond the data boundary. This avoids edge effects at the data perimeter. |
+
+> **Note:** If the sample points are colinear or degenerate and PyQhull's `ConvexHull` fails, the engine silently falls back to a bounding-box grid with a warning. No crash — just a rectangular prediction area instead of a hull-shaped one.
 
 ---
 
@@ -205,8 +209,8 @@ less intuitive to inspect.
 engine:
   kriging:
     max_anisotropy: 10.0
-    n_splits: 5
-    n_trials: 10
+    n_splits: 3
+    n_trials: 300
 ```
 
 #### `n_splits` — the most important Kriging parameter
@@ -270,8 +274,8 @@ the engine tries before deciding which one is best.
 | 300–500 | High quality. Use when accuracy matters more than speed. |
 | > 500 | Diminishing returns in most cases. |
 
-The default in `config.yaml` is `n_trials: 10`, which is intentionally low for quick
-testing. **Raise it to at least 100 for production runs.**
+The default in `config.yaml` is `n_trials: 300`, which suits most production datasets.
+Reduce to 50–100 for quick exploratory runs.
 
 ---
 
@@ -289,6 +293,45 @@ prevents the optimizer from finding physically implausible solutions (e.g. ratio
 **How to choose:** Start with your domain knowledge. If you expect strong directional
 continuity (e.g. a fluvial deposit), allow a higher value (10–15). For roughly isotropic
 fields, a lower cap (2–3) keeps the search space smaller and converges faster.
+
+---
+
+### 5.1.4 `fit_with_known_params()` — skip Optuna with pre-computed parameters
+
+Once Optuna has found the best variogram model and parameters for a dataset, you
+may want to reuse them on the same dataset later (CI runs, experiments, fast
+re-prediction after changing the grid). Instead of re-running the full search,
+provide the cached parameters directly:
+
+```python
+from src.engines.kriging import AnisotropicKriging
+model = AnisotropicKriging(n_splits=5, max_anisotropy=10.0)
+model.fit_with_known_params(X, y, model_name="spherical", best_params={
+    "sill": 15.2, "range": 590.4, "nugget": 0.1,
+    "azimuth": 42.0, "anisotropy_ratio": 2.3
+})
+```
+
+The engine skips Optuna and CV entirely and instantiates the requested variogram
+model directly — identical predictions in a fraction of a second.
+
+**Parameter cache format (JSON):** The test suite uses this pattern with
+pre-computed caches in `test_data/params_cache/`. Each file follows this schema:
+
+```json
+{
+  "model_name": "spherical",
+  "params": {
+    "sill": 15.2, "range": 590.4, "nugget": 0.1,
+    "azimuth": 42.0, "anisotropy_ratio": 2.3
+  }
+}
+```
+
+**When to use this:**
+- Running the same analysis after changing only the prediction grid or export format
+- CI/test pipelines where speed matters and parameters are already validated
+- Sharing fitted parameters between team members
 
 ---
 
@@ -353,7 +396,27 @@ Set to `null` for a different result each run. Set to any integer for reproducib
 
 ---
 
-## 6. `output`
+## 6. Input Validation
+
+Before any fitting starts, the engine runs five checks on your data at `fit()` entry.
+Each raises a clear `ValueError` instead of letting the downstream optimizer or
+solver produce an opaque crash:
+
+| Check | What triggers it | Error message includes |
+|-------|------------------|-----------------------|
+| `validate_finite` | NaN or Inf in coordinates or target values | `"contains N non-finite value(s)"` |
+| `validate_min_samples` | Fewer than 5 data points | `"Only N data point(s) provided"` |
+| `validate_not_constant` | All target values are identical | `"All target values are identical"` |
+| `validate_2d_coordinates` | Array isn't (n, 2), all points coincident, or perfectly colinear | `"Expected (n, 2)"`, `"same location"`, `"perfectly colinear"` |
+| `validate_shape_match` | Number of coordinates doesn't match number of values | `"Mismatch: N coordinate rows but M values"` |
+
+**What this means in practice:** A bad input file never reaches Optuna or PyKrige
+— you get an immediate, human-readable error pointing at exactly what is wrong
+with your data. If you see one of these messages, fix the data condition and re-run.
+
+---
+
+## 7. `output`
 
 ```yaml
 output:
@@ -361,8 +424,8 @@ output:
   netcdf_z_dim_name: elev
   save_diagnostics: true
   formats:
-    - nc
-    - tif
+    # - nc
+    # - tif
     - csv
 ```
 
@@ -401,7 +464,7 @@ output:
 
 ---
 
-## Quick-reference: parameter choices by scenario
+## 8. Quick-reference: parameter choices by scenario
 
 | Scenario | Recommended settings |
 |----------|----------------------|
@@ -414,3 +477,4 @@ output:
 | Exporting for QGIS/ArcGIS | `formats: [tif]` |
 | Exporting for Paraview | `formats: [nc]` |
 | Everything at once | `formats: [nc, tif, csv]` |
+| Debugging edge cases | See `test_data/`: S9 (few points), S10 (duplicates), S11 (colinear), S12 (log-normal → NST), S13 (strong trend → detrend), S14 (extreme aniso → high `max_anisotropy`) |
