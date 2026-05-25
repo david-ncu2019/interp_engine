@@ -1,20 +1,36 @@
-# Ignore all files
-*
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
 
-# Do not ignore directories (so Git can traverse them)
-!*/
+# Data files (generated, not tracked)
+*.csv
+*.xlsx
+*.xls
 
-# Only include Python files
-!*.py
+# Config files (local, not tracked)
+*.yaml
+*.yml
 
-# Also track config and documentation files
-!*.yaml
-!*.md
+# Output directories
+output/
+output_*/
+*.png
+*.jpg
 
-# Allow test data and parameter files
-!*.csv
-!*.json
+# Compressed archives
+*.xz
+*.tar.*
 
-# Re-ignore generated output and settings files
-comparison_summary.csv
+# Claude Code
 .claude/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
