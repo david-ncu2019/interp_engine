@@ -27,6 +27,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import time
+import logging
+logger = logging.getLogger(__name__)
+from dataclasses import dataclass, field
+from typing import Optional, Any
 
 from src.data_loader import load_input_data, load_custom_prediction_points
 from src.geometry import generate_prediction_grid
@@ -48,13 +52,55 @@ from utils import (
     plot_cv_dashboard,
     plot_trend_components,
 )
-# sklearn kernel imports are no longer needed in main.py:
-# the composite kernel (ConstantKernel * Matern/RBF + WhiteKernel) is now
-# constructed entirely inside RotatedGPR.fit() using adaptive bounds passed
-# as constructor arguments.  Removing the import keeps the namespace clean.
 
 
-# ── helpers ───────────────────────────────────────────────────────────────
+# ── Pipeline state dataclasses ──────────────────────────────────────────────
+
+@dataclass
+class LoadedData:
+    """Result of _load_and_validate_data()."""
+    X_coord: np.ndarray
+    Y_coord: np.ndarray
+    Z_val: np.ndarray
+    X: np.ndarray           # stacked (n,2)
+    gt: Optional[tuple]     # (gt_X, gt_Y, gt_Z) or None
+    scenario_name: str
+
+
+@dataclass
+class PreprocessResult:
+    """Result of _preprocess_trend_and_nst()."""
+    Z_fit: np.ndarray
+    processor: Optional[TrendProcessor]
+    nst: Optional[NormalScoreTransform]
+    norm: dict
+
+
+@dataclass
+class GeometryResult:
+    """Result of _setup_prediction_targets()."""
+    is_point_mode: bool
+    X_grid: Optional[np.ndarray]
+    Y_grid: Optional[np.ndarray]
+    mask: Optional[np.ndarray]
+    grid_shape: Optional[tuple]
+    hull_verts: Optional[np.ndarray]
+    valid_points: np.ndarray
+    X_out: Optional[np.ndarray]
+    Y_out: Optional[np.ndarray]
+    df_out: Optional[Any]   # pd.DataFrame or None
+
+
+@dataclass
+class PredictResult:
+    """Result of _predict()."""
+    pred_mean: Optional[np.ndarray]
+    pred_std: Optional[np.ndarray]
+    point_pred_mean: Optional[np.ndarray]
+    point_pred_std: Optional[np.ndarray]
+
+
+# ── helpers ─────────────────────────────────────────────────────────────────
 
 def load_config(filepath: str) -> dict:
     """Load YAML configuration file."""
@@ -83,7 +129,7 @@ def load_ground_truth(config: dict):
 
     gt_path = Path(gt_path_str)
     if not gt_path.exists():
-        print(f"  ⚠ Ground truth file not found: {gt_path}  (skipping)")
+        logger.warning("Ground truth file not found: %s  (skipping)", gt_path)
         return None
 
     cols = config["input"].get("columns", {})
@@ -107,7 +153,7 @@ def save_parameter_summary(params: dict, mode: str, out_dir: Path):
         json.dump({"engine": mode, **params}, f, indent=2, default=str)
 
 
-# ── coordinate cleaning ───────────────────────────────────────────────────
+# ── coordinate cleaning ─────────────────────────────────────────────────────
 
 def check_and_clean_duplicates(
     X: np.ndarray,
@@ -156,7 +202,7 @@ def check_and_clean_duplicates(
 
     dist_mat = squareform(pdist(X))
 
-    # ── Step 1: merge exact duplicates (distance == 0) ────────────────────────
+    # ── Step 1: merge exact duplicates (distance == 0) ──────────────────────────
     # Build clusters of co-located points iteratively.
     visited   = np.zeros(len(X), dtype=bool)
     keep_mask = np.ones(len(X),  dtype=bool)
@@ -176,7 +222,7 @@ def check_and_clean_duplicates(
     X = X[keep_mask]
     Z = Z[keep_mask]
 
-    # ── Step 2: jitter near-duplicates (0 < distance < min_separation) ───────
+    # ── Step 2: jitter near-duplicates (0 < distance < min_separation) ─────────
     dist_mat2 = squareform(pdist(X))
     np.fill_diagonal(dist_mat2, np.inf)
 
@@ -204,47 +250,25 @@ def check_and_clean_duplicates(
     return X, Z, report
 
 
-# ── main pipeline ─────────────────────────────────────────────────────────
+# ── pipeline stage functions ─────────────────────────────────────────────────
 
-def run_pipeline():
-    import sys
-    config_path_str = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
-    config_path = Path(config_path_str)
-    if not config_path.exists():
-        print(f"Error: {config_path} not found.")
-        return
-
-    config = load_config(config_path)
-    out_dir = derive_output_dir(config)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    out_cfg = config.get("output", {})
+def _load_and_validate_data(config: dict, out_dir: Path) -> LoadedData:
+    """[1/7] Load input data, clean duplicates, load ground truth."""
     scenario_name = Path(config["input"]["filepath"]).stem
 
-    print("=" * 60)
-    print(f"  Interpolation Engine  –  {scenario_name}")
-    print("=" * 60)
-
-    # ── 1. Load Data ──────────────────────────────────────────────────
-    print("\n[1/7] Loading data ...")
+    logger.info("\n[1/7] Loading data ...")
     X_coord, Y_coord, Z_val = load_input_data(config)
     X = np.column_stack((X_coord, Y_coord))
-    print(f"       {len(Z_val)} sample points loaded.")
+    logger.info(f"       {len(Z_val)} sample points loaded.")
 
-    # Guard: spatial interpolation requires a minimum number of points.
     if len(Z_val) < 5:
         raise ValueError(
             f"Only {len(Z_val)} data point(s) loaded. At least 5 are required "
             f"for variogram fitting and kriging. Please provide a larger dataset."
         )
 
-    # ── 1.1. Duplicate / near-duplicate coordinate guard ──────────────
-    # Two samples at (or very near) the same location will make the
-    # covariance matrix singular and cause a crash or silent failure.
-    # This step merges exact duplicates (taking the mean value) and
-    # jitters near-duplicates to enforce a minimum separation distance.
+    # Duplicate / near-duplicate coordinate guard
     dup_cfg = config.get("preprocessing", {}).get("duplicates", {})
-    # Compute default min_separation from data geometry if not set in config
     from scipy.spatial.distance import pdist as _pdist_dup, squareform as _sq_dup
     _d_dup = _sq_dup(_pdist_dup(X))
     np.fill_diagonal(_d_dup, np.inf)
@@ -255,7 +279,6 @@ def run_pipeline():
     X, Z_val, dup_report = check_and_clean_duplicates(X, Z_val, min_separation=min_sep)
     X_coord, Y_coord = X[:, 0], X[:, 1]
 
-    # Guard: duplicate merging can reduce the dataset below the viable minimum.
     if len(Z_val) < 3:
         raise ValueError(
             f"After duplicate removal, only {len(Z_val)} unique point(s) remain. "
@@ -266,177 +289,189 @@ def run_pipeline():
         )
 
     if dup_report["n_exact"] > 0 or dup_report["n_near"] > 0:
-        print(f"  ⚠  Duplicate guard: {dup_report['n_exact']} exact duplicates merged, "
+        logger.info(f"  ⚠  Duplicate guard: {dup_report['n_exact']} exact duplicates merged, "
               f"{dup_report['n_near']} near-duplicates jittered "
               f"(min_sep={min_sep:.3f} m).")
-        print(f"       Points after cleaning: {len(Z_val)} "
+        logger.info(f"       Points after cleaning: {len(Z_val)} "
               f"(removed {dup_report['n_removed']})")
     else:
-        print(f"       No duplicate coordinates detected (min_sep={min_sep:.3f} m). ✓")
+        logger.info(f"       No duplicate coordinates detected (min_sep={min_sep:.3f} m). ✓")
 
     gt = load_ground_truth(config)
     if gt is not None:
-        gt_X, gt_Y, gt_Z = gt
-        print(f"       {len(gt_Z)} ground-truth points loaded.")
+        logger.info(f"       {len(gt[2])} ground-truth points loaded.")
 
-    # ── 1.5. Preprocessing (Detrending) ───────────────────────────────
+    return LoadedData(
+        X_coord=X_coord, Y_coord=Y_coord, Z_val=Z_val, X=X,
+        gt=gt, scenario_name=scenario_name,
+    )
+
+
+def _preprocess_trend_and_nst(
+    data: LoadedData, config: dict
+) -> PreprocessResult:
+    """[1.5/7] Trend detection, detrending, and Normal-Score Transform."""
+    X_coord, Y_coord, Z_val = data.X_coord, data.Y_coord, data.Z_val
+
     pre_cfg = config.get("preprocessing", {}).get("detrend", {})
     do_detrend = pre_cfg.get("enabled", False)
     auto_detect = pre_cfg.get("auto_detect", True)
     trend_order = pre_cfg.get("order", 1)
 
-    print("\n[1.5/7] Trend Analysis & Preprocessing ...")
+    logger.info("\n[1.5/7] Trend Analysis & Preprocessing ...")
     if auto_detect:
-        # Pass trend_order so the F-test matches the polynomial order that will
-        # actually be used for detrending — detection and correction are consistent.
         trend_stats = analyze_trend(X_coord, Y_coord, Z_val, order=trend_order)
-        print(f"       Polynomial order tested       : {trend_stats['tested_order']}")
-        print(f"       Trend F-test p-value          : {trend_stats['f_pvalue']:.4e}")
-        print(f"       Trend R²                      : {trend_stats['r2']:.4f}")
+        logger.info(f"       Polynomial order tested       : {trend_stats['tested_order']}")
+        logger.info(f"       Trend F-test p-value          : {trend_stats['f_pvalue']:.4e}")
+        logger.info(f"       Trend R²                      : {trend_stats['r2']:.4f}")
         if not np.isnan(trend_stats['moran_i']):
-            print(f"       Moran's I (raw data)         : {trend_stats['moran_i']:.4f} (p={trend_stats['moran_p']:.4e})")
+            logger.info(f"       Moran's I (raw data)         : {trend_stats['moran_i']:.4f} "
+                  f"(p={trend_stats['moran_p']:.4e})")
 
-        # ── Normality report (from analyze_trend) ─────────────────────────────
         norm = trend_stats.get("normality", {})
         if norm:
             sw_p = norm.get("shapiro_p", float("nan"))
             sk   = norm.get("skewness",  0.0)
             kurt = norm.get("kurtosis",  0.0)
-            print(f"       Shapiro-Wilk p-value         : {sw_p:.4e}  "
+            logger.info(f"       Shapiro-Wilk p-value         : {sw_p:.4e}  "
                   f"({'normal' if norm.get('is_normal') else 'NON-NORMAL'})")
-            print(f"       Skewness / Excess Kurtosis   : {sk:.3f} / {kurt:.3f}")
+            logger.info(f"       Skewness / Excess Kurtosis   : {sk:.3f} / {kurt:.3f}")
 
         do_detrend = trend_stats['recommend_detrend']
         if do_detrend:
-            print("       -> Significant trend detected. Detrending ENABLED.")
+            logger.info("       -> Significant trend detected. Detrending ENABLED.")
         else:
-            print("       -> No significant trend. Detrending DISABLED.")
+            logger.info("       -> No significant trend. Detrending DISABLED.")
     else:
-        print(f"       Auto-detect disabled. Detrending is {'ENABLED' if do_detrend else 'DISABLED'} by config.")
+        logger.info(f"       Auto-detect disabled. Detrending is "
+              f"{'ENABLED' if do_detrend else 'DISABLED'} by config.")
         norm = {}
 
     if do_detrend:
-        print(f"       Detrending (order={trend_order}) ...")
+        logger.info(f"       Detrending (order={trend_order}) ...")
         processor = TrendProcessor(order=trend_order)
         processor.fit(X_coord, Y_coord, Z_val)
         Z_fit = processor.detrend(X_coord, Y_coord, Z_val)
-
         t_params = processor.get_params()
-        print(f"       Trend fitted. Intercept: {t_params['intercept']:.3f}")
+        logger.info(f"       Trend fitted. Intercept: {t_params['intercept']:.3f}")
     else:
         processor = None
         Z_fit = Z_val
 
-    # ── Normal-Score Transform (NST) ──────────────────────────────────────────
-    # Applied AFTER detrending (the residuals should be Gaussian; if they are
-    # not, NST corrects the marginal distribution before spatial modelling).
-    #
-    # Priority order:
-    #   1. config key  preprocessing.nst.enabled  (explicit user override)
-    #   2. auto-detect via Shapiro-Wilk + skewness (from analyze_trend)
-    #   3. default: disabled
-    #
-    # The NST is always invertible: back-transform is applied to predictions
-    # in [6/7] before writing outputs, so all output files are in original units.
-    nst_cfg      = config.get("preprocessing", {}).get("nst", {})
-    nst_enabled  = nst_cfg.get("enabled", None)   # None = auto-detect
+    # Normal-Score Transform (NST)
+    nst_cfg     = config.get("preprocessing", {}).get("nst", {})
+    nst_enabled = nst_cfg.get("enabled", None)
 
     if nst_enabled is None:
-        # Auto-detect: use the normality check result from analyze_trend
         nst_enabled = bool(norm.get("recommend_nst", False))
 
-    # ── NST preflight summary ─────────────────────────────────────────────────
-    # Print a clear, user-readable report of the distribution diagnostic and
-    # the NST decision BEFORE any model fitting.  This makes preprocessing
-    # decisions transparent and allows the user to verify the auto-detect
-    # logic is behaving correctly.
-    print("\n       ── Distribution Diagnostic ──")
+    logger.info("\n       ── Distribution Diagnostic ──")
     if norm:
-        _sw_sym  = "✓" if norm.get("is_normal") else "✗"
-        _sk_sym  = "✓" if abs(norm.get("skewness", 0)) <= 0.5 else "✗"
-        _ku_sym  = "✓" if abs(norm.get("kurtosis", 0)) <= 1.0 else "✗"
-        print(f"       {_sw_sym} Shapiro-Wilk p   : {norm.get('shapiro_p', float('nan')):.4e}"
+        _sw_sym = "✓" if norm.get("is_normal") else "✗"
+        _sk_sym = "✓" if abs(norm.get("skewness", 0)) <= 0.5 else "✗"
+        _ku_sym = "✓" if abs(norm.get("kurtosis", 0)) <= 1.0 else "✗"
+        logger.info(f"       {_sw_sym} Shapiro-Wilk p   : {norm.get('shapiro_p', float('nan')):.4e}"
               f"  ({'normal' if norm.get('is_normal') else 'NON-NORMAL'})")
-        print(f"       {_sk_sym} Skewness         : {norm.get('skewness', 0):.3f}"
+        logger.info(f"       {_sk_sym} Skewness         : {norm.get('skewness', 0):.3f}"
               f"  (threshold |skew| > 0.5)")
-        print(f"       {_ku_sym} Excess kurtosis  : {norm.get('kurtosis', 0):.3f}"
+        logger.info(f"       {_ku_sym} Excess kurtosis  : {norm.get('kurtosis', 0):.3f}"
               f"  (threshold |kurt| > 1.0)")
     else:
-        print("       (normality check skipped — auto_detect is disabled)")
+        logger.info("       (normality check skipped — auto_detect is disabled)")
 
     nst = None
     if nst_enabled:
         nst = NormalScoreTransform(tail_extrapolation=True)
         Z_fit = nst.fit_transform(Z_fit)
         nst_summary = nst.summary()
-        print(f"       → NST APPLIED  (all 3 criteria met)")
-        print(f"         Knots: {nst_summary['n_knots']}  "
+        logger.info(f"       → NST APPLIED  (all 3 criteria met)")
+        logger.info(f"         Knots: {nst_summary['n_knots']}  "
               f"|  original range: [{nst_summary['x_min']:.3f}, {nst_summary['x_max']:.3f}]")
-        print(f"         Z_fit is now N(0,1)-distributed.")
-        print(f"         Predictions will be back-transformed to original units.")
+        logger.info(f"         Z_fit is now N(0,1)-distributed.")
+        logger.info(f"         Predictions will be back-transformed to original units.")
     else:
-        print(f"       → NST SKIPPED  (data is sufficiently Gaussian — no transform needed)")
+        logger.info(f"       → NST SKIPPED  (data is sufficiently Gaussian — no transform needed)")
 
-    # ── 2. Geometry ───────────────────────────────────────────────────
+    return PreprocessResult(Z_fit=Z_fit, processor=processor, nst=nst, norm=norm)
+
+
+def _setup_prediction_targets(
+    data: LoadedData, config: dict
+) -> GeometryResult:
+    """[2/7] Build prediction grid or load custom prediction points."""
+    X_coord, Y_coord = data.X_coord, data.Y_coord
     pred_cfg = config.get("prediction_points")
     is_point_mode = pred_cfg is not None
-    
+
     if is_point_mode:
-        print("[2/7] Point Mode active: Loading custom prediction points...")
+        logger.info("[2/7] Point Mode active: Loading custom prediction points...")
         pts_file = pred_cfg.get("filepath")
         cols = pred_cfg.get("columns", {})
         col_x = cols.get("x") or "X"
         col_y = cols.get("y") or "Y"
-        
+
         X_out, Y_out, df_out = load_custom_prediction_points(pts_file, col_x, col_y)
-        print(f"       Loaded {len(X_out)} custom points.")
-        print(f"       Note: Assuming custom points share the same CRS as input data.")
-        
-        X_grid, Y_grid, mask, grid_shape, hull_verts = None, None, None, None, None
-        valid_points = np.column_stack((X_out, Y_out))
+        logger.info(f"       Loaded {len(X_out)} custom points.")
+        logger.info(f"       Note: Assuming custom points share the same CRS as input data.")
+
+        return GeometryResult(
+            is_point_mode=True,
+            X_grid=None, Y_grid=None, mask=None, grid_shape=None, hull_verts=None,
+            valid_points=np.column_stack((X_out, Y_out)),
+            X_out=X_out, Y_out=Y_out, df_out=df_out,
+        )
     else:
-        print("[2/7] Building prediction grid (buffered convex hull) ...")
+        logger.info("[2/7] Building prediction grid (buffered convex hull) ...")
         X_grid, Y_grid, mask, grid_shape, hull_verts = generate_prediction_grid(
             X_coord, Y_coord, config
         )
-        print(f"       Grid: {grid_shape[1]}x{grid_shape[0]}  |  "
+        logger.info(f"       Grid: {grid_shape[1]}x{grid_shape[0]}  |  "
               f"Inside hull: {np.sum(mask)} pts")
 
-    # ── 3. Ground truth visualisation (A_) ────────────────────────────
-    print("[3/7] Ground truth visualisation ...")
-    if gt is not None:
+        grid_points = np.column_stack((X_grid.flatten(), Y_grid.flatten()))
+        valid_points = grid_points[mask]
+
+        return GeometryResult(
+            is_point_mode=False,
+            X_grid=X_grid, Y_grid=Y_grid, mask=mask,
+            grid_shape=grid_shape, hull_verts=hull_verts,
+            valid_points=valid_points,
+            X_out=None, Y_out=None, df_out=None,
+        )
+
+
+def _ground_truth_visualisation(
+    data: LoadedData, out_dir: Path
+) -> None:
+    """[3/7] Plot ground truth if available."""
+    logger.info("[3/7] Ground truth visualisation ...")
+    if data.gt is not None:
+        gt_X, gt_Y, gt_Z = data.gt
         plot_ground_truth(
             gt_X, gt_Y, gt_Z,
-            sample_X=X_coord, sample_Y=Y_coord,
-            scenario_name=scenario_name,
+            sample_X=data.X_coord, sample_Y=data.Y_coord,
+            scenario_name=data.scenario_name,
             save_path=out_dir / "A_ground_truth.png",
         )
-        print("       ✓ A_ground_truth.png")
+        logger.info("       ✓ A_ground_truth.png")
     else:
-        print("       (skipped – no ground_truth_filepath in config)")
+        logger.info("       (skipped – no ground_truth_filepath in config)")
 
-    # ── 4. Set up engine ──────────────────────────────────────────────
+
+def _create_engine(
+    X: np.ndarray, Z_fit: np.ndarray, config: dict
+) -> tuple:
+    """[4/7] Instantiate and configure the interpolation engine.
+
+    Returns (model, mode).
+    """
     engine_cfg = config.get("engine", {})
     mode = engine_cfg.get("mode", "gp").lower()
 
     if mode == "gp":
-        print("[4/7] Initialising RotatedGPR ...")
+        logger.info("[4/7] Initialising RotatedGPR ...")
         gp_cfg = engine_cfg.get("gp", {})
 
-        # ── Adaptive length scale bounds ──────────────────────────────────────
-        # Fixed config values like ls_min=10 and ls_max=5000 are dangerous:
-        # they are unrelated to the actual point spacing and domain extent of
-        # the dataset being processed.  When the true spatial range falls
-        # outside these bounds, the optimizer cannot find it and the kernel
-        # collapses (length scale pinned to a boundary → constant predictor).
-        #
-        # We compute bounds directly from the data geometry:
-        #   ls_min = 0.5 × median nearest-neighbour distance
-        #            (below this, no pair of training points is correlated)
-        #   ls_max = 0.6 × max pairwise distance
-        #            (beyond this, all points are globally correlated → no info)
-        #
-        # The user can still override with explicit config keys if desired.
         from scipy.spatial.distance import pdist, squareform as _squareform
         _dists_sq = _squareform(pdist(X))
         np.fill_diagonal(_dists_sq, np.inf)
@@ -451,15 +486,13 @@ def run_pipeline():
         ls_max = gp_cfg.get("length_scale_max_override", ls_max_auto)
         ls_init = gp_cfg.get("length_scale", (ls_min + ls_max) / 2.0)
 
-        print(f"       Adaptive ls bounds: [{ls_min:.2f},  {ls_max:.2f}]  "
+        logger.info(f"       Adaptive ls bounds: [{ls_min:.2f},  {ls_max:.2f}]  "
               f"(median NN={_median_nn:.2f}, max_dist={_max_dist:.2f})")
 
-        # ── Signal variance bounds from data ──────────────────────────────────
         data_var  = float(np.var(Z_fit))
         var_min   = max(data_var * 0.01, 1e-4)
         var_max   = data_var * 20.0
 
-        # ── Nugget bounds: allow from near-zero up to 80% of data variance ────
         nug_min = gp_cfg.get("nugget_min", 1e-6)
         nug_max = gp_cfg.get("nugget_max", data_var * 0.8)
 
@@ -477,94 +510,129 @@ def run_pipeline():
             ),
             n_optuna_trials = gp_cfg.get("n_optuna_trials", 300),
             random_state   = gp_cfg.get("random_state", None),
+            n_jobs         = gp_cfg.get("n_jobs", 1),
         )
     elif mode == "kriging":
-        print("[4/7] Initialising AnisotropicKriging ...")
+        logger.info("[4/7] Initialising AnisotropicKriging ...")
         k_cfg = engine_cfg.get("kriging", {})
         model = AnisotropicKriging(
             n_trials=k_cfg.get("n_trials", 50),
             n_splits=k_cfg.get("n_splits", 5),
             max_anisotropy=k_cfg.get("max_anisotropy", 3.0),
+            n_jobs=k_cfg.get("n_jobs", 1),
             verbose=False,
         )
     else:
         raise ValueError(f"Unknown engine mode: {mode}")
 
-    # ── 5. Fit ────────────────────────────────────────────────────────
-    print("[5/7] Fitting model ...")
+    return model, mode
+
+
+def _fit_model(
+    model: Any, X: np.ndarray, Z_fit: np.ndarray, mode: str, out_dir: Path
+) -> dict:
+    """[5/7] Fit the model, print parameter summary, return params dict."""
+    logger.info("[5/7] Fitting model ...")
     t0 = time.time()
     model.fit(X, Z_fit)
     elapsed = time.time() - t0
-    print(f"       Completed in {elapsed:.2f} s.")
+    logger.info(f"       Completed in {elapsed:.2f} s.")
 
     params = model.get_kernel_params()
-    print("       ── Recovered Parameters ──")
+    logger.info("       ── Recovered Parameters ──")
     for k, v in params.items():
-        print(f"       {k:30s}: {v}")
+        logger.info(f"       {k:30s}: {v}")
 
     save_parameter_summary(params, mode, out_dir)
+    return params
 
-    # ── 6. Predict ────────────────────────────────────────────
+
+def _predict(
+    model: Any,
+    geo: GeometryResult,
+    pp: PreprocessResult,
+) -> PredictResult:
+    """[6/7] Predict on grid or points, back-transform NST and trend."""
     point_pred_mean = None
     point_pred_std = None
+    pred_mean = None
+    pred_std = None
 
-    if is_point_mode:
-        print("[6/7] Predicting over custom points ...")
+    if geo.is_point_mode:
+        logger.info("[6/7] Predicting over custom points ...")
     else:
-        print("[6/7] Predicting over spatial grid ...")
-        pred_mean = np.full(grid_shape, np.nan)
-        pred_std = np.full(grid_shape, np.nan)
+        logger.info("[6/7] Predicting over spatial grid ...")
+        pred_mean = np.full(geo.grid_shape, np.nan)
+        pred_std = np.full(geo.grid_shape, np.nan)
 
-        grid_points = np.column_stack((X_grid.flatten(), Y_grid.flatten()))
-        valid_points = grid_points[mask]
+    if len(geo.valid_points) > 0:
+        means, stds = model.predict(geo.valid_points, return_std=True)
 
-    if len(valid_points) > 0:
-        means, stds = model.predict(valid_points, return_std=True)
-        # Back-transform NST first (normal scores → original distribution),
-        # then add the polynomial trend back (detrended residuals → original units).
-        # Order matters: NST was applied to the detrended residuals, so NST
-        # inverse must come before re-trending.
-        if nst is not None:
-            # std is in normal-score units; approximate back-transform via
-            # finite-difference of the NST inverse *before* means is overwritten.
+        if pp.nst is not None:
             delta = 0.01
-            dnst  = 0.5 * np.abs(
-                nst.inverse_transform(means + delta) -
-                nst.inverse_transform(means - delta)
-            ) / delta          # local derivative dx/dz at each prediction point
-            means = nst.inverse_transform(means)
-            stds  = dnst * stds   # propagate std through the nonlinear transform
-        if processor is not None:
-            means = processor.retrend(valid_points[:, 0], valid_points[:, 1], means)
-            
-        if is_point_mode:
+            dnst = 0.5 * np.abs(
+                pp.nst.inverse_transform(means + delta) -
+                pp.nst.inverse_transform(means - delta)
+            ) / delta
+            means = pp.nst.inverse_transform(means)
+            stds = dnst * stds
+        if pp.processor is not None:
+            means = pp.processor.retrend(
+                geo.valid_points[:, 0], geo.valid_points[:, 1], means
+            )
+
+        if geo.is_point_mode:
             point_pred_mean = means
             point_pred_std = stds
         else:
-            pred_mean.flat[mask] = means
-            pred_std.flat[mask] = stds
+            pred_mean.flat[geo.mask] = means
+            pred_std.flat[geo.mask] = stds
 
-    # ── 7. Diagnostics & export ───────────────────────────────────────
-    print("[7/7] Generating outputs ...")
+    return PredictResult(
+        pred_mean=pred_mean, pred_std=pred_std,
+        point_pred_mean=point_pred_mean, point_pred_std=point_pred_std,
+    )
+
+
+def _export_and_diagnose(
+    model: Any,
+    data: LoadedData,
+    geo: GeometryResult,
+    pp: PreprocessResult,
+    pred: PredictResult,
+    params: dict,
+    mode: str,
+    out_dir: Path,
+    config: dict,
+) -> None:
+    """[7/7] All diagnostics, cross-validation, metrics, and file export."""
+    out_cfg = config.get("output", {})
+    scenario_name = data.scenario_name
+    X = data.X
+    Z_fit = pp.Z_fit
+    Z_val = data.Z_val
+
+    logger.info("[7/7] Generating outputs ...")
 
     # B_ Convex hull
-    if not is_point_mode:
+    if not geo.is_point_mode:
         plot_convex_hull(
-            X_coord, Y_coord, Z_val,
-            hull_verts, X_grid, Y_grid, mask,
+            data.X_coord, data.Y_coord, Z_val,
+            geo.hull_verts, geo.X_grid, geo.Y_grid, geo.mask,
             scenario_name=scenario_name,
             save_path=out_dir / "B_convex_hull.png",
         )
-        print("       ✓ B_convex_hull.png")
+        logger.info("       ✓ B_convex_hull.png")
 
-    if processor is not None and out_cfg.get("save_diagnostics", True) and not is_point_mode:
+    if (pp.processor is not None and out_cfg.get("save_diagnostics", True)
+            and not geo.is_point_mode):
         plot_trend_components(
-            X_coord, Y_coord, Z_val, Z_fit, processor,
-            X_grid, Y_grid, mask, hull_verts,
+            data.X_coord, data.Y_coord, Z_val, Z_fit, pp.processor,
+            geo.X_grid, geo.Y_grid, geo.mask, geo.hull_verts,
             scenario_name=scenario_name,
             save_path=out_dir / "C_trend_components.png"
         )
-        print("       ✓ C_trend_components.png")
+        logger.info("       ✓ C_trend_components.png")
 
     if out_cfg.get("save_diagnostics", True):
         # D_ Omnidirectional variogram
@@ -576,7 +644,7 @@ def run_pipeline():
             scenario_name=scenario_name,
             save_path=out_dir / f"D_variogram_omni_{mode}.png",
         )
-        print(f"       ✓ D_variogram_omni_{mode}.png")
+        logger.info(f"       ✓ D_variogram_omni_{mode}.png")
 
         # E_ Directional variogram (15° intervals)
         directions = np.arange(0, 180, 15)
@@ -586,7 +654,7 @@ def run_pipeline():
             scenario_name=scenario_name,
             save_path=out_dir / f"E_variogram_directional_{mode}.png",
         )
-        print(f"       ✓ E_variogram_directional_{mode}.png")
+        logger.info(f"       ✓ E_variogram_directional_{mode}.png")
 
         # F_ Anisotropy ellipse
         plot_anisotropy_ellipse(
@@ -595,39 +663,40 @@ def run_pipeline():
             scenario_name=scenario_name,
             save_path=out_dir / f"F_anisotropy_ellipse_{mode}.png",
         )
-        print(f"       ✓ F_anisotropy_ellipse_{mode}.png")
+        logger.info(f"       ✓ F_anisotropy_ellipse_{mode}.png")
 
-    if not is_point_mode:
+    if not geo.is_point_mode:
         # G_ Prediction surface
         plot_prediction_surface(
-            X_grid, Y_grid, pred_mean, pred_std,
-            X_obs=X_coord, Y_obs=Y_coord,
-            hull_vertices=hull_verts,
+            geo.X_grid, geo.Y_grid, pred.pred_mean, pred.pred_std,
+            X_obs=data.X_coord, Y_obs=data.Y_coord,
+            hull_vertices=geo.hull_verts,
             scenario_name=scenario_name,
             engine_name=mode.upper(),
             save_path=out_dir / f"G_prediction_surface_{mode}.png",
         )
-        print(f"       ✓ G_prediction_surface_{mode}.png")
+        logger.info(f"       ✓ G_prediction_surface_{mode}.png")
 
         # H_ Comparison (only if ground truth available)
-        if gt is not None:
+        if data.gt is not None:
+            gt_X, gt_Y, gt_Z = data.gt
             plot_comparison(
-                X_grid, Y_grid, pred_mean,
+                geo.X_grid, geo.Y_grid, pred.pred_mean,
                 gt_X, gt_Y, gt_Z,
-                hull_vertices=hull_verts,
+                hull_vertices=geo.hull_verts,
                 scenario_name=scenario_name,
                 engine_name=mode.upper(),
                 save_path=out_dir / f"H_comparison_{mode}.png",
             )
-            print(f"       ✓ H_comparison_{mode}.png")
+            logger.info(f"       ✓ H_comparison_{mode}.png")
 
     # I_ Cross-validation dashboard
     if out_cfg.get("save_diagnostics", True):
-        print("       Running cross-validation ...")
+        logger.info("       Running cross-validation ...")
         if mode == "gp":
-            cv_df = perform_gpr_kfold_cv(model, X, Z_fit, nst=nst)
+            cv_df = perform_gpr_kfold_cv(model, X, Z_fit, nst=pp.nst)
         else:
-            cv_df = perform_kriging_kfold_cv(model, X, Z_fit, nst=nst)
+            cv_df = perform_kriging_kfold_cv(model, X, Z_fit, nst=pp.nst)
         cv_df.to_csv(out_dir / f"cv_results_{mode}.csv", index=False)
         plot_cv_dashboard(
             cv_df,
@@ -635,95 +704,80 @@ def run_pipeline():
             scenario_name=scenario_name,
             save_path=out_dir / f"I_cv_dashboard_{mode}.png",
         )
-        print(f"       ✓ I_cv_dashboard_{mode}.png")
-        print(f"       ✓ cv_results_{mode}.csv")
-        
+        logger.info(f"       ✓ I_cv_dashboard_{mode}.png")
+        logger.info(f"       ✓ cv_results_{mode}.csv")
+
         # Calculate and print evaluation metrics
         from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
         obs = cv_df['Observed']
-        pred = cv_df['Predicted']
-        mae = mean_absolute_error(obs, pred)
-        rmse = np.sqrt(mean_squared_error(obs, pred))
-        r2 = r2_score(obs, pred)
+        pred_cv = cv_df['Predicted']
+        mae = mean_absolute_error(obs, pred_cv)
+        rmse = np.sqrt(mean_squared_error(obs, pred_cv))
+        r2 = r2_score(obs, pred_cv)
 
-        # ── Theoretical R² ceiling from nugget ratio ──────────────────────
-        # The nugget (C₀) represents variance that no spatial model can ever
-        # explain: pure measurement noise + sub-resolution variability.
-        # R²_ceiling = 1 − C₀ / (C₀ + C)   where C is the structured sill.
-        # If the achieved R² is near the ceiling the engine is performing as
-        # well as the data physically allows; if it is far below the ceiling
-        # there is room to improve the model or data collection strategy.
-        params = model.get_kernel_params() if mode == "gp" else dict(model.best_params_)
-        r2_ceiling: float | None = None
+        # Theoretical R² ceiling from nugget ratio
+        cv_params = model.get_kernel_params() if mode == "gp" else dict(model.best_params_)
+        r2_ceiling: Optional[float] = None
         try:
             if mode == "gp":
-                # WhiteKernel stores noise variance; ConstantKernel stores signal variance
-                nugget_var = float(params.get("nugget_variance", 0.0))
-                signal_var = float(params.get("constant_value", 1.0))
+                nugget_var = float(cv_params.get("nugget_variance", 0.0))
+                signal_var = float(cv_params.get("constant_value", 1.0))
                 total_var = nugget_var + signal_var
                 if total_var > 0:
                     r2_ceiling = 1.0 - nugget_var / total_var
             else:
-                # Kriging params contain 'nugget' (C₀) and 'psill' (structured sill C)
-                nugget_var = float(params.get("nugget", 0.0))
-                psill_var  = float(params.get("psill",  1.0))
+                nugget_var = float(cv_params.get("nugget", 0.0))
+                psill_var  = float(cv_params.get("psill",  1.0))
                 total_var = nugget_var + psill_var
                 if total_var > 0:
                     r2_ceiling = 1.0 - nugget_var / total_var
-        except Exception:
+        except (KeyError, TypeError):
             r2_ceiling = None
-        # ──────────────────────────────────────────────────────────────────
 
-        # ── CV sanity check — catch silent numerical failures ─────────────
-        # R² must lie in roughly [-1, 1] for a meaningful interpolation result.
-        # RMSE must be smaller than the data standard deviation (otherwise the
-        # model is worse than predicting the mean for every point).
-        # Values outside these bounds indicate numerical failure — most commonly
-        # caused by NST inverse-transform overflow (e.g., Kriging overshoot on
-        # clustered data) or a singular covariance matrix in one or more folds.
-        _data_std = float(np.std(Z_val))   # std of original (pre-NST) data
+        # CV sanity check
+        _data_std = float(np.std(Z_val))
         _sanity_ok = True
         if r2 < -0.1:
-            print(f"\n  ⚠⚠  CV SANITY FAILURE: R² = {r2:.4g} is physically impossible.")
-            print(f"       This usually means NST inverse-transform produced extreme")
-            print(f"       values in one or more folds (Kriging overshoot + tail extrap).")
-            print(f"       CV metrics are unreliable for this run.")
+            logger.warning(f"\n  ⚠⚠  CV SANITY FAILURE: R² = {r2:.4g} is physically impossible.")
+            logger.info(f"       This usually means NST inverse-transform produced extreme")
+            logger.info(f"       values in one or more folds (Kriging overshoot + tail extrap).")
+            logger.info(f"       CV metrics are unreliable for this run.")
             _sanity_ok = False
         if _data_std > 0 and rmse > 10.0 * _data_std:
-            print(f"\n  ⚠⚠  CV SANITY FAILURE: RMSE = {rmse:.4g} is {rmse/_data_std:.1f}× "
+            logger.warning(f"\n  ⚠⚠  CV SANITY FAILURE: RMSE = {rmse:.4g} is {rmse/_data_std:.1f}× "
                   f"the data std ({_data_std:.4g}).")
-            print(f"       Predictions are far worse than the global mean predictor.")
+            logger.info(f"       Predictions are far worse than the global mean predictor.")
             _sanity_ok = False
 
-        print("\n       ── Cross-Validation Metrics ──")
-        print(f"       MAE        : {mae:.4f}")
-        print(f"       RMSE       : {rmse:.4f}")
-        print(f"       R²         : {r2:.4f}")
+        logger.info("\n       ── Cross-Validation Metrics ──")
+        logger.info(f"       MAE        : {mae:.4f}")
+        logger.info(f"       RMSE       : {rmse:.4f}")
+        logger.info(f"       R²         : {r2:.4f}")
         if not _sanity_ok:
-            print(f"       ⚠  Metrics above are flagged as unreliable (see warnings).")
+            logger.warning(f"       ⚠  Metrics above are flagged as unreliable (see warnings).")
         if r2_ceiling is not None:
             nugget_pct = (1.0 - r2_ceiling) * 100.0
-            print(f"       R² ceiling : {r2_ceiling:.4f}  "
+            logger.info(f"       R² ceiling : {r2_ceiling:.4f}  "
                   f"(nugget accounts for {nugget_pct:.1f}% of total variance)")
             gap = r2_ceiling - r2
             if gap < 0.05:
-                print("       ✓ Engine is near the theoretical limit for this dataset.")
+                logger.info("       ✓ Engine is near the theoretical limit for this dataset.")
             elif gap < 0.20:
-                print(f"       ↑ Gap to ceiling: {gap:.4f} — moderate room for improvement.")
+                logger.info(f"       ↑ Gap to ceiling: {gap:.4f} — moderate room for improvement.")
             else:
-                print(f"       ↑ Gap to ceiling: {gap:.4f} — consider data density / model selection.")
+                logger.info(f"       ↑ Gap to ceiling: {gap:.4f} — consider data density / model selection.")
 
     # Export
     requested_formats = out_cfg.get("formats", None)
 
-    if is_point_mode:
-        if len(valid_points) == 0:
+    if geo.is_point_mode:
+        if len(geo.valid_points) == 0:
             raise RuntimeError(
                 "No valid prediction points to export. This can happen if all "
                 "custom prediction points lie outside the data envelope."
             )
-        df_out['Predicted_Mean'] = point_pred_mean
-        df_out['Predicted_Std'] = point_pred_std
+        geo.df_out['Predicted_Mean'] = pred.point_pred_mean
+        geo.df_out['Predicted_Std'] = pred.point_pred_std
 
         point_formats = requested_formats if requested_formats is not None else ["csv", "xz"]
 
@@ -736,31 +790,100 @@ def run_pipeline():
 
         if "csv" in point_formats:
             csv_path = out_dir / f"predicted_points_{mode}.csv"
-            df_out.to_csv(csv_path, index=False)
-            print(f"       ✓ predicted_points_{mode}.csv")
+            geo.df_out.to_csv(csv_path, index=False)
+            logger.info(f"       ✓ predicted_points_{mode}.csv")
 
         if "xz" in point_formats:
             xz_path = out_dir / f"predicted_points_{mode}.xz"
-            df_out.to_pickle(xz_path)
-            print(f"       ✓ predicted_points_{mode}.xz")
+            geo.df_out.to_pickle(xz_path)
+            logger.info(f"       ✓ predicted_points_{mode}.xz")
     else:
         grid_formats = requested_formats if requested_formats is not None else ["nc"]
         z_dim = out_cfg.get("netcdf_z_dim_name", "Depth")
         export_grid(
             grid_formats,
-            X_grid, Y_grid, pred_mean, pred_std,
+            geo.X_grid, geo.Y_grid, pred.pred_mean, pred.pred_std,
             output_dir=out_dir,
             engine_name=mode,
             z_dim_name=z_dim,
         )
 
-    # Parameters (already saved earlier, just confirm)
-    print(f"       ✓ parameters_{mode}.txt")
-    print(f"       ✓ parameters_{mode}.json")
+    logger.info(f"       ✓ parameters_{mode}.txt")
+    logger.info(f"       ✓ parameters_{mode}.json")
 
-    print("\n" + "=" * 60)
-    print(f"  All outputs saved to:  {out_dir}")
-    print("=" * 60)
+
+# ── main pipeline ───────────────────────────────────────────────────────────
+
+def run_pipeline():
+    import sys
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Spatial Interpolation Engine — kriging and GP backends",
+    )
+    parser.add_argument(
+        "config", nargs="?", default="config.yaml",
+        help="Path to YAML configuration file (default: config.yaml)",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Show debug-level output (Optuna trials, post-fit details)",
+    )
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="Suppress info-level output; show only warnings and errors",
+    )
+    args = parser.parse_args()
+
+    # Configure logging
+    if args.quiet:
+        logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    elif args.verbose:
+        logging.basicConfig(level=logging.DEBUG, format="%(message)s")
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    config_path = Path(args.config)
+    if not config_path.exists():
+        logger.error("Config file not found: %s", config_path)
+        return
+
+    config = load_config(config_path)
+    out_dir = derive_output_dir(config)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    scenario_name = Path(config["input"]["filepath"]).stem
+
+    logger.info("=" * 60)
+    logger.info(f"  Interpolation Engine  –  {scenario_name}")
+    logger.info("=" * 60)
+
+    # 1. Load & validate
+    data = _load_and_validate_data(config, out_dir)
+
+    # 1.5. Preprocess
+    pp = _preprocess_trend_and_nst(data, config)
+
+    # 2. Geometry
+    geo = _setup_prediction_targets(data, config)
+
+    # 3. Ground truth visualisation
+    _ground_truth_visualisation(data, out_dir)
+
+    # 4. Create engine
+    model, mode = _create_engine(data.X, pp.Z_fit, config)
+
+    # 5. Fit
+    params = _fit_model(model, data.X, pp.Z_fit, mode, out_dir)
+
+    # 6. Predict
+    pred = _predict(model, geo, pp)
+
+    # 7. Diagnostics & export
+    _export_and_diagnose(model, data, geo, pp, pred, params, mode, out_dir, config)
+
+    logger.info("\n" + "=" * 60)
+    logger.info(f"  All outputs saved to:  {out_dir}")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":

@@ -211,6 +211,7 @@ engine:
     max_anisotropy: 10.0
     n_splits: 3
     n_trials: 300
+    n_jobs: 1
 ```
 
 #### `n_splits` — the most important Kriging parameter
@@ -335,6 +336,21 @@ pre-computed caches in `test_data/params_cache/`. Each file follows this schema:
 
 ---
 
+#### `n_jobs`
+
+```yaml
+engine:
+  kriging:
+    n_jobs: 1
+```
+
+Controls parallel execution of Optuna trials. Default is `1` (sequential). Set to `-1`
+to use all CPU cores, or any positive integer. Parallel trials use joblib's `loky`
+backend; the objective function must be picklable. On Windows, ensure the fit call
+is inside `if __name__ == '__main__'`. Set back to `1` if you encounter pickling errors.
+
+---
+
 ### 5.2 GP (Gaussian Process) parameters
 
 ```yaml
@@ -345,6 +361,12 @@ engine:
     max_anisotropy: 15.0
     n_optuna_trials: 300
     random_state: 42
+    n_jobs: 1
+    length_scale_min_override: null
+    length_scale_max_override: null
+    length_scale: null
+    nugget_min: 1e-6
+    nugget_max: null
 ```
 
 #### `n_optuna_trials`
@@ -393,6 +415,78 @@ for roughly isotropic phenomena.
 
 Seeds the random number generators in Optuna and KMeans so that results are reproducible.
 Set to `null` for a different result each run. Set to any integer for reproducibility.
+
+---
+
+#### `length_scale_min_override` / `length_scale_max_override`
+
+```yaml
+engine:
+  gp:
+    length_scale_min_override: null
+    length_scale_max_override: null
+```
+
+Override the adaptive length scale bounds. When `null`, the engine computes them from
+the data geometry:
+
+- `ls_min` = 0.5 x median nearest-neighbour distance (no pair of training points is
+  closer than this — a sensible lower bound on correlation range)
+- `ls_max` = 0.6 x max pairwise distance (no pair is farther apart — a sensible
+  upper bound)
+
+Override when you have domain knowledge about the spatial scale. Setting `ls_min` too
+large prevents the model from capturing short-range variation; setting `ls_max` too
+small forces the kernel to treat all variation as noise.
+
+---
+
+#### `length_scale`
+
+```yaml
+engine:
+  gp:
+    length_scale: null
+```
+
+Initial value for the major-axis length scale. When `null`, defaults to the midpoint
+of the adaptive bounds. Override to provide a starting guess for Optuna if you know
+the approximate correlation range. Not a constraint — the optimiser explores freely
+within `ls_bounds`.
+
+---
+
+#### `nugget_min` / `nugget_max`
+
+```yaml
+engine:
+  gp:
+    nugget_min: 1e-6
+    nugget_max: null
+```
+
+Search range for the nugget (WhiteKernel noise variance). `nugget_min` defaults to
+`1e-6` (effectively zero noise). `nugget_max` defaults to 80% of the data variance
+when `null`. Override when your measurement instrument has known noise characteristics:
+
+- Raise `nugget_min` (e.g. `0.1`) if you know your sensor has a noise floor
+- Lower `nugget_max` (e.g. `data_var * 0.2`) to force the model to attribute more
+  variance to spatial structure rather than noise
+
+---
+
+#### `n_jobs`
+
+```yaml
+engine:
+  gp:
+    n_jobs: 1
+```
+
+Controls parallel execution of Optuna trials. Default is `1` (sequential). Set to `-1`
+to use all CPU cores, or any positive integer. Parallel trials use joblib; the objective
+function must be picklable. On Windows, ensure the fit call is inside
+`if __name__ == '__main__'`. Set to `1` if you encounter pickling errors.
 
 ---
 

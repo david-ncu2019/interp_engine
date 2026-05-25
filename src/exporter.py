@@ -5,6 +5,8 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import logging
+logger = logging.getLogger(__name__)
 
 
 def export_to_netcdf(
@@ -50,7 +52,7 @@ def export_to_netcdf(
     )
 
     ds.to_netcdf(out_path)
-    print(f"       ✓ predicted_{engine_name}.nc")
+    logger.info(f"       ✓ predicted_{engine_name}.nc")
 
 
 def export_to_geotiff(
@@ -103,7 +105,7 @@ def export_to_geotiff(
         with rasterio.open(out_path, "w", **tif_profile) as dst:
             # rasterio expects row 0 at the top; flip Y axis to match
             dst.write(np.flipud(arr).astype(np.float32), 1)
-        print(f"       ✓ predicted_{engine_name}_{suffix}.tif")
+        logger.info(f"       ✓ predicted_{engine_name}_{suffix}.tif")
 
 
 def export_grid_to_csv(
@@ -128,7 +130,7 @@ def export_grid_to_csv(
     })
     df = df.dropna(subset=["predicted_mean"])   # drop cells outside convex hull
     df.to_csv(out_path, index=False)
-    print(f"       ✓ predicted_{engine_name}.csv")
+    logger.info(f"       ✓ predicted_{engine_name}.csv")
 
 
 _GRID_FORMAT_HANDLERS = {

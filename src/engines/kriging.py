@@ -4,10 +4,14 @@ kriging.py - Ordinary Kriging with Optuna-based anisotropic parameter optimizati
 from typing import Optional, Dict, Any
 import numpy as np
 import os
+import logging
 import matplotlib.pyplot as plt
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.cluster import KMeans
 import optuna
+from tqdm.auto import tqdm
+
+logger = logging.getLogger(__name__)
 
 from src.validation import (
     validate_finite,
@@ -183,8 +187,9 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
                     y_pred, _ = ok.execute('points', X[val_idx, 0], X[val_idx, 1])
                     mse = float(np.mean((y[val_idx] - y_pred) ** 2))
                     scores.append(mse)
-                except Exception:
-                    # 'inf' occurs if the Kriging system is singular or numerically unstable
+                except Exception as e:
+                    logger.debug("Kriging fold %d failed in trial %d: %s",
+                                 fold, trial.number, e)
                     return float('inf')
             
             return np.mean(scores) if scores else float('inf')
@@ -204,9 +209,16 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
                 p = trial.params
                 p_str = f"model={p['model']}, psill={p['psill']:.2e}, range={p['range']:.1f}, nugget={p['nugget']:.2e}"
                 
-                print(f"  [Trial {trial.number}] val={val_str}, best={best_val} | {p_str}", flush=True)
+                logger.debug("  [Trial %d] val=%s, best=%s | %s", trial.number, val_str, best_val, p_str)
 
-        self.study_.optimize(objective, n_trials=self.n_trials, callbacks=[logging_callback], n_jobs=self.n_jobs)
+        _show_pbar = self.verbose and self.n_jobs <= 1
+        with tqdm(total=self.n_trials, desc="Optuna (Kriging)",
+                  disable=not _show_pbar, leave=False) as pbar:
+            self.study_.optimize(
+                objective, n_trials=self.n_trials,
+                callbacks=[logging_callback, lambda s, t: pbar.update(1)],
+                n_jobs=self.n_jobs,
+            )
 
         # ── Guard: study may have zero successful trials ───────────────────
         if len(self.study_.trials) == 0 or all(

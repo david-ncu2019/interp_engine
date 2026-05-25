@@ -1,0 +1,11 @@
+numpy
+pandas
+xarray
+netCDF4
+matplotlib
+scipy
+scikit-learn
+optuna
+pykrige
+pyyaml
+tqdm

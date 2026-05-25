@@ -29,6 +29,8 @@ Additionally:
 from typing import Optional, Tuple, Any, Dict
 import numpy as np
 import warnings
+import logging
+logger = logging.getLogger(__name__)
 from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import (
@@ -36,6 +38,7 @@ from sklearn.gaussian_process.kernels import (
 )
 from scipy.optimize import minimize as sp_minimize
 import optuna
+from tqdm.auto import tqdm
 
 
 # ── Kernel candidate catalogue ────────────────────────────────────────────────
@@ -119,6 +122,7 @@ class RotatedGPR(BaseEstimator, RegressorMixin):
         n_optuna_trials:  int = 300,
         random_state:     Optional[int] = None,
         center_coords:    bool = True,
+        n_jobs:           int = 1,
     ):
         self.ls_init          = ls_init
         self.ls_bounds        = ls_bounds
@@ -131,6 +135,7 @@ class RotatedGPR(BaseEstimator, RegressorMixin):
         self.n_optuna_trials  = n_optuna_trials
         self.random_state     = random_state
         self.center_coords    = center_coords
+        self.n_jobs           = n_jobs
 
         # Set after fit()
         self.best_angle_deg_          = None
@@ -203,7 +208,9 @@ class RotatedGPR(BaseEstimator, RegressorMixin):
                 warnings.simplefilter("ignore")
                 gp.fit(X_rot, self.y_train_)
                 return -gp.log_marginal_likelihood()
-        except Exception:
+        except Exception as e:
+            logger.debug("LML evaluation failed for angle=%.1f, kernel=%s: %s",
+                         angle, kernel_type, e)
             return float("inf")
 
     # ── coarse angle scan helper ──────────────────────────────────────────────
@@ -252,7 +259,7 @@ class RotatedGPR(BaseEstimator, RegressorMixin):
 
         best_angle = angle_min
         best_nll   = float("inf")
-        for ang in candidates:
+        for ang in tqdm(candidates, desc="Angle scan", leave=False):
             nll = self._eval_lml(
                 angle       = float(ang),
                 kernel_type = "matern_52",   # moderate smoothness for the scan
@@ -348,7 +355,7 @@ class RotatedGPR(BaseEstimator, RegressorMixin):
             angle_min_fine = max(self.angle_bounds[0], coarse_best_angle - fine_window)
             angle_max_fine = min(self.angle_bounds[1], angle_min_fine + 40.0)
 
-        print(f"       [GP angle scan] coarse best angle: {coarse_best_angle:.1f}°  "
+        logger.info(f"       [GP angle scan] coarse best angle: {coarse_best_angle:.1f}°  "
               f"→ Optuna search window: [{angle_min_fine:.1f}°, {angle_max_fine:.1f}°]")
 
         # ── Stage 1: Optuna refined search inside the angle window ────────────
@@ -378,7 +385,14 @@ class RotatedGPR(BaseEstimator, RegressorMixin):
             direction="minimize",
             sampler=optuna.samplers.TPESampler(seed=self.random_state),
         )
-        study.optimize(objective, n_trials=self.n_optuna_trials)
+        _show_pbar = self.n_jobs <= 1
+        with tqdm(total=self.n_optuna_trials, desc="Optuna (GP)",
+                  disable=not _show_pbar, leave=False) as pbar:
+            study.optimize(
+                objective, n_trials=self.n_optuna_trials,
+                callbacks=[lambda s, t: pbar.update(1)],
+                n_jobs=self.n_jobs,
+            )
         self.study_ = study
 
         bp = study.best_params
@@ -427,45 +441,15 @@ class RotatedGPR(BaseEstimator, RegressorMixin):
             if res.fun < study.best_value:
                 (best_angle, best_log_var, best_log_lmaj,
                  best_ratio, best_log_nug, best_log_alpha) = res.x
-        except Exception:
-            pass  # keep Optuna result if L-BFGS-B fails
+        except Exception as e:
+            logger.warning("L-BFGS-B local refinement failed: %s. Using Optuna result.", e)
 
         # ── Stage 3: Build final kernel and fit ───────────────────────────────
-        final_var    = np.exp(best_log_var)
-        final_ls_maj = np.exp(best_log_lmaj)
-        final_ls_min = np.exp(best_log_lmaj - best_ratio)
-        final_nugget = np.exp(best_log_nug)
-        final_alpha  = float(np.exp(best_log_alpha))
-
-        base_k = build_base_kernel(best_kernel_type, final_ls_maj, self.ls_bounds)
-        base_k.length_scale = [final_ls_maj, final_ls_min]
-
-        final_kernel = ConstantKernel(
-            constant_value=final_var,
-            constant_value_bounds=self.var_bounds,
-        ) * base_k + WhiteKernel(
-            noise_level=final_nugget,
-            noise_level_bounds=self.nugget_bounds,
+        self._fit_final_model(
+            float(best_angle), best_kernel_type,
+            best_log_var, best_log_lmaj, best_ratio,
+            best_log_nug, best_log_alpha,
         )
-
-        self.best_angle_deg_   = float(best_angle)
-        self.best_kernel_type_ = best_kernel_type
-        self.best_alpha_       = final_alpha
-
-        X_final = self._rotate_coords(self.X_train_centered_, self.best_angle_deg_)
-        self.gp_model_ = GaussianProcessRegressor(
-            kernel=final_kernel,
-            alpha=final_alpha,
-            optimizer=None,
-            normalize_y=True,
-            random_state=self.random_state,
-        )
-        self.gp_model_.fit(X_final, self.y_train_)
-        self.log_marginal_likelihood_ = self.gp_model_.log_marginal_likelihood()
-
-        # ── Post-fit verification ─────────────────────────────────────────────
-        self._post_fit_report(final_ls_maj, final_ls_min, final_nugget)
-
         return self
 
     def _post_fit_report(
@@ -497,13 +481,115 @@ class RotatedGPR(BaseEstimator, RegressorMixin):
             )
 
         # Console report
-        print(f"       [GP post-fit] kernel type                : {self.best_kernel_type_}")
-        print(f"       [GP post-fit] log marginal likelihood     : {self.log_marginal_likelihood_:.4f}")
-        print(f"       [GP post-fit] rotation angle              : {self.best_angle_deg_:.2f} deg")
-        print(f"       [GP post-fit] length scales (maj / min)   : {ls_maj:.2f} / {ls_min:.2f}")
-        print(f"       [GP post-fit] anisotropy ratio            : {actual_ratio:.3f}")
-        print(f"       [GP post-fit] nugget variance             : {nugget:.6f}")
-        print(f"       [GP post-fit] jitter alpha                : {self.best_alpha_:.6f}")
+        logger.info(f"       [GP post-fit] kernel type                : {self.best_kernel_type_}")
+        logger.info(f"       [GP post-fit] log marginal likelihood     : {self.log_marginal_likelihood_:.4f}")
+        logger.info(f"       [GP post-fit] rotation angle              : {self.best_angle_deg_:.2f} deg")
+        logger.info(f"       [GP post-fit] length scales (maj / min)   : {ls_maj:.2f} / {ls_min:.2f}")
+        logger.info(f"       [GP post-fit] anisotropy ratio            : {actual_ratio:.3f}")
+        logger.info(f"       [GP post-fit] nugget variance             : {nugget:.6f}")
+        logger.info(f"       [GP post-fit] jitter alpha                : {self.best_alpha_:.6f}")
+
+    def _fit_final_model(
+        self,
+        angle: float,
+        kernel_type: str,
+        log_var: float,
+        log_lmaj: float,
+        ratio_log: float,
+        log_nugget: float,
+        log_alpha: float,
+    ) -> None:
+        """Build final kernel and fit GaussianProcessRegressor with given params."""
+        final_var    = np.exp(log_var)
+        final_ls_maj = np.exp(log_lmaj)
+        final_ls_min = np.exp(log_lmaj - ratio_log)
+        final_nugget = np.exp(log_nugget)
+        final_alpha  = float(np.exp(log_alpha))
+
+        base_k = build_base_kernel(kernel_type, final_ls_maj, self.ls_bounds)
+        base_k.length_scale = [final_ls_maj, final_ls_min]
+
+        final_kernel = ConstantKernel(
+            constant_value=final_var,
+            constant_value_bounds=self.var_bounds,
+        ) * base_k + WhiteKernel(
+            noise_level=final_nugget,
+            noise_level_bounds=self.nugget_bounds,
+        )
+
+        self.best_angle_deg_   = float(angle)
+        self.best_kernel_type_ = kernel_type
+        self.best_alpha_       = final_alpha
+
+        X_final = self._rotate_coords(self.X_train_centered_, self.best_angle_deg_)
+        self.gp_model_ = GaussianProcessRegressor(
+            kernel=final_kernel,
+            alpha=final_alpha,
+            optimizer=None,
+            normalize_y=True,
+            random_state=self.random_state,
+        )
+        self.gp_model_.fit(X_final, self.y_train_)
+        self.log_marginal_likelihood_ = self.gp_model_.log_marginal_likelihood()
+        self._post_fit_report(final_ls_maj, final_ls_min, final_nugget)
+
+    def fit_with_known_params(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        best_params: dict,
+    ) -> "RotatedGPR":
+        """Fit using known parameters, bypassing the Optuna optimization.
+
+        This is the fast-path counterpart to :meth:`fit`.  Use it when you
+        already have optimal parameters (e.g. from a previous run stored in
+        a parameter cache) and want to re-fit the GP on the same or similar
+        data without re-running the full Optuna search.
+
+        Parameters
+        ----------
+        X           : (n, 2) coordinate array
+        y           : (n,) target values
+        best_params : dict with keys ``angle``, ``kernel_type``, ``log_var``,
+                      ``log_lmaj``, ``ratio_log``, ``log_nugget``, ``log_alpha``.
+                      This is the dictionary saved by a previous call to
+                      :meth:`fit` (accessible via ``study.best_params``).
+
+        Returns
+        -------
+        self
+        """
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        self.X_train_ = np.asarray(X, dtype=np.float64)
+        self.y_train_ = np.asarray(y, dtype=np.float64)
+
+        from src.validation import (
+            validate_2d_coordinates, validate_not_constant,
+            validate_finite, validate_shape_match,
+        )
+        validate_finite(self.X_train_, self.y_train_)
+        validate_shape_match(self.X_train_, self.y_train_)
+        validate_2d_coordinates(self.X_train_)
+        validate_not_constant(self.y_train_)
+
+        if self.center_coords:
+            self.X_train_centered_, self.X_center_ = \
+                self._center_coordinates(self.X_train_)
+        else:
+            self.X_train_centered_ = self.X_train_
+            self.X_center_         = np.zeros(2)
+
+        self._fit_final_model(
+            angle      = float(best_params["angle"]),
+            kernel_type = str(best_params["kernel_type"]),
+            log_var     = float(best_params["log_var"]),
+            log_lmaj    = float(best_params["log_lmaj"]),
+            ratio_log   = float(best_params.get("ratio_log", 0.0)),
+            log_nugget  = float(best_params["log_nugget"]),
+            log_alpha   = float(best_params["log_alpha"]),
+        )
+        return self
 
     # ── predict ───────────────────────────────────────────────────────────────
 

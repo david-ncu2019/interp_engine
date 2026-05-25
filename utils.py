@@ -3,12 +3,16 @@ Diagnostics module for interpolation engine validation.
 Provides empirical variogram, cross-validation, and publication-quality plots.
 """
 import os
+import logging
 import warnings
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
+
+logger = logging.getLogger(__name__)
 from matplotlib.patches import Ellipse
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.base import clone
@@ -422,7 +426,7 @@ def perform_gpr_kfold_cv(rgpr_model, X, y, n_folds=5, seed=42, nst=None):
     clusters = make_spatial_block_folds(X, n_folds)
 
     results = []
-    for fold in range(n_folds):
+    for fold in tqdm(range(n_folds), desc="CV fold", leave=False):
         tr = clusters != fold
         te = clusters == fold
         X_tr, y_tr = X[tr], y[tr]
@@ -519,7 +523,7 @@ def perform_kriging_kfold_cv(ak_model, X, y, n_folds=5, seed=42, nst=None):
     model_name = ak_model.best_model_name_
 
     results = []
-    for fold in range(n_folds):
+    for fold in tqdm(range(n_folds), desc="CV fold", leave=False):
         tr = clusters != fold
         te = clusters == fold
         X_tr, y_tr = X[tr], y[tr]
@@ -552,9 +556,8 @@ def perform_kriging_kfold_cv(ak_model, X, y, n_folds=5, seed=42, nst=None):
                 fold_psill  = float(max(_params[1], 1e-6))
                 fold_bp["nugget"] = fold_nugget
                 fold_bp["psill"]  = fold_psill
-        except Exception:
-            # If skgstat is unavailable or the fit fails, fall back to global
-            pass
+        except Exception as e:
+            logger.warning("Per-fold nugget re-estimation with skgstat failed: %s", e)
         # ──────────────────────────────────────────────────────────────────
 
         try:
@@ -562,7 +565,8 @@ def perform_kriging_kfold_cv(ak_model, X, y, n_folds=5, seed=42, nst=None):
             pred, var = ok.execute("points", X_te[:, 0], X_te[:, 1])
             pred = np.asarray(pred, dtype=np.float64)
             std  = np.sqrt(np.abs(np.asarray(var, dtype=np.float64)))
-        except Exception:
+        except Exception as e:
+            logger.warning("Kriging CV fold %d failed: %s", fold, e)
             continue
 
         # ── NST back-transform (approach b: original units) ───────────────

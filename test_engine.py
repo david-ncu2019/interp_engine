@@ -18,6 +18,7 @@ import warnings
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.engines.kriging import AnisotropicKriging
+from src.engines.gp import RotatedGPR
 from src.preprocessor import TrendProcessor, NormalScoreTransform, check_normality
 
 warnings.filterwarnings("ignore")
@@ -60,6 +61,21 @@ def get_cached_params(name: str, X, y, max_anisotropy=3.0, n_trials=100):
         "params": {k: v for k, v in model.best_params_.items()},
     }, indent=2, default=str))
     return model.best_model_name_, dict(model.best_params_)
+
+
+def get_cached_gp_params(name: str, X, y, max_anisotropy=3.0, n_trials=40):
+    """Load cached GP parameters, or fit once and cache them."""
+    CACHE_DIR.mkdir(exist_ok=True)
+    cache_path = CACHE_DIR / f"{name}_gp.json"
+    if cache_path.exists():
+        return json.loads(cache_path.read_text())
+    model = RotatedGPR(n_optuna_trials=n_trials, max_anisotropy=max_anisotropy,
+                       random_state=42)
+    model.fit(X, y)
+    # Save the Optuna best_params (the dict needed by fit_with_known_params)
+    params = {k: v for k, v in model.study_.best_params.items()}
+    cache_path.write_text(json.dumps(params, indent=2, default=str))
+    return params
 
 def r2_score(y_true, y_pred):
     ss_res = np.sum((y_true - y_pred) ** 2)
@@ -477,6 +493,155 @@ def test_full_pipeline_kriging():
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 21-26. GP Engine Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_gp_isotropic_fit():
+    header("21. GP Isotropic Fit (S1 — 500 pts)")
+    X, y, gt = load_scenario("S1_Isotropic")
+    check(len(X) == 500, f"Loaded 500 points (got {len(X)})")
+
+    params = get_cached_gp_params("S1_Isotropic", X, y, max_anisotropy=3.0, n_trials=30)
+    model = RotatedGPR(random_state=42)
+    model.fit_with_known_params(X, y, params)
+
+    p = model.get_kernel_params()
+    ls = np.atleast_1d(p["length_scale"])
+    check(len(ls) == 2 and ls[0] > 0 and ls[1] > 0,
+          f"Length scales = [{ls[0]:.1f}, {ls[1]:.1f}] > 0")
+    check(p["constant_value"] > 0, f"Signal var = {p['constant_value']:.3f} > 0")
+    check(p["nugget_variance"] >= 0, f"Nugget var = {p['nugget_variance']:.6f} >= 0")
+    check(np.isfinite(p["log_marginal_likelihood"]),
+          f"LML = {p['log_marginal_likelihood']:.2f} (finite)")
+
+    if gt is not None:
+        X_gt, y_gt = gt
+        y_pred, y_std = model.predict(X_gt, return_std=True)
+        r2 = r2_score(y_gt, y_pred)
+        check(r2 > 0.3, f"R^2 = {r2:.4f} > 0.3")
+        check(np.all(np.isfinite(y_pred)), "All predictions finite")
+        check(np.all(y_std >= 0), "All std >= 0")
+        print(f"    RMSE={rmse(y_gt, y_pred):.4f}  R^2={r2:.4f}")
+
+
+def test_gp_anisotropic_recovery():
+    header("22. GP Anisotropic Recovery (S2 — angle=45deg, ratio=2)")
+    X, y, gt = load_scenario("S2_Anisotropic_45deg")
+    check(len(X) == 500, f"Loaded 500 points (got {len(X)})")
+
+    params = get_cached_gp_params("S2_Anisotropic_45deg", X, y, max_anisotropy=5.0, n_trials=30)
+    model = RotatedGPR(random_state=42)
+    model.fit_with_known_params(X, y, params)
+
+    p = model.get_kernel_params()
+    angle, ratio = p["rotation_angle_deg"], p["anisotropy_ratio"]
+    check(10.0 <= angle <= 80.0, f"Angle = {angle:.1f} in [10,80]")
+    check(ratio >= 1.2, f"Ratio = {ratio:.2f} >= 1.2")
+    print(f"    angle={angle:.1f}  ratio={ratio:.2f}")
+
+
+def test_gp_high_nugget():
+    header("23. GP High Nugget (S4)")
+    X, y, _ = load_scenario("S4_HighNugget_Isotropic")
+    check(len(X) == 500, f"Loaded 500 points (got {len(X)})")
+
+    params = get_cached_gp_params("S4_HighNugget_Isotropic", X, y, max_anisotropy=3.0, n_trials=30)
+    model = RotatedGPR(random_state=42)
+    model.fit_with_known_params(X, y, params)
+
+    p = model.get_kernel_params()
+    check(p["nugget_variance"] > 0, f"Nugget var = {p['nugget_variance']:.6f} > 0")
+    check(p["constant_value"] > 0, f"Signal var = {p['constant_value']:.3f} > 0")
+    frac = p["nugget_variance"] / (p["constant_value"] + p["nugget_variance"] + EPS)
+    print(f"    nugget={p['nugget_variance']:.6f}  signal={p['constant_value']:.3f}  "
+          f"frac={frac:.3f}")
+
+
+def test_gp_predict_shapes():
+    header("24. GP Predict Output Shapes")
+    X, y, _ = load_scenario("S1_Isotropic")
+    params = get_cached_gp_params("S1_Isotropic", X, y, max_anisotropy=3.0, n_trials=30)
+    model = RotatedGPR(random_state=42)
+    model.fit_with_known_params(X, y, params)
+
+    single = np.array([[X[0, 0], X[0, 1]]])
+    pred, std = model.predict(single, return_std=True)
+    check(pred.shape == (1,), f"Single point shape: {pred.shape}")
+    check(pred.dtype.kind == 'f', "Float dtype")
+
+    batch = X[:10]
+    pred_b, std_b = model.predict(batch, return_std=True)
+    check(pred_b.shape == (10,), f"10-point shape: {pred_b.shape}")
+    check(std_b.shape == (10,), f"Std shape: {std_b.shape}")
+
+    pred_c, cov = model.predict(single, return_cov=True)
+    check(cov.shape == (1, 1), f"Cov shape: {cov.shape}")
+
+
+def test_gp_get_kernel_params_keys():
+    header("25. GP get_kernel_params Returns All Keys")
+    X, y, _ = load_scenario("S1_Isotropic")
+    params = get_cached_gp_params("S1_Isotropic", X, y, max_anisotropy=3.0, n_trials=30)
+    model = RotatedGPR(random_state=42)
+    model.fit_with_known_params(X, y, params)
+
+    p = model.get_kernel_params()
+    required = [
+        "kernel_type", "rotation_angle_deg", "constant_value",
+        "length_scale", "anisotropy_ratio", "nugget_variance",
+        "jitter_alpha", "log_marginal_likelihood",
+    ]
+    for key in required:
+        check(key in p, f"'{key}' present")
+    check(p["kernel_type"] in ("matern_32", "matern_52", "rbf"),
+          f"kernel_type is '{p['kernel_type']}'")
+
+
+def test_full_pipeline_gp():
+    header("26. Full Pipeline - GP End-to-End")
+    import subprocess, tempfile, yaml, shutil
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="gp_test_"))
+    try:
+        cfg = {
+            "input": {"filepath": str(DATA_DIR / "S1_Isotropic.csv"), "format": "csv",
+                       "columns": {"x": "X", "y": "Y", "value": "Value"},
+                       "ground_truth_filepath": None},
+            "geometry": {"resolution_m": 50.0, "convex_hull_buffer_percent": 10.0},
+            "preprocessing": {"detrend": {"auto_detect": False, "enabled": False, "order": 1},
+                              "nst": {"enabled": False},
+                              "duplicates": {"min_separation": None}},
+            "engine": {"mode": "gp",
+                        "gp": {"max_anisotropy": 3.0, "n_optuna_trials": 20,
+                               "angle_min": 0.0, "angle_max": 180.0,
+                               "random_state": 42}},
+            "output": {"base_directory": str(tmp_dir / "output"),
+                        "save_diagnostics": True, "formats": ["csv"]},
+        }
+        cfg_path = tmp_dir / "test_config_gp.yaml"
+        with open(cfg_path, "w") as f:
+            yaml.dump(cfg, f)
+
+        result = subprocess.run(
+            [PYTHON, "main.py", str(cfg_path)],
+            capture_output=True, text=True, timeout=360,
+            cwd=str(Path(__file__).parent),
+        )
+        check(result.returncode == 0, f"GP Pipeline exit code {result.returncode}")
+        if result.returncode != 0:
+            for l in (result.stdout + result.stderr).split("\n")[-15:]:
+                if l.strip():
+                    print(f"    [pipe] {l}")
+
+        out_dir = tmp_dir / "output" / "S1_Isotropic"
+        check((out_dir / "parameters_gp.json").exists(), "parameters_gp.json exists")
+        check((out_dir / "cv_results_gp.csv").exists(), "cv_results_gp.csv exists")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
@@ -484,7 +649,7 @@ def test_full_pipeline_kriging():
 if __name__ == "__main__":
     t_start = time.time()
     print("=" * 60)
-    print("  Kriging Engine Test Suite (with param caching)")
+    print("  Interpolation Engine Test Suite (with param caching)")
     print(f"  Python: {PYTHON}")
     print("=" * 60)
 
@@ -498,6 +663,9 @@ if __name__ == "__main__":
         test_nst_roundtrip, test_nst_small_sample,
         test_max_anisotropy_bound, test_all_models_trial,
         test_full_pipeline_kriging,
+        test_gp_isotropic_fit, test_gp_anisotropic_recovery, test_gp_high_nugget,
+        test_gp_predict_shapes, test_gp_get_kernel_params_keys,
+        test_full_pipeline_gp,
     ]
 
     for test in tests:

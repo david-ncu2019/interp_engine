@@ -1,4 +1,5 @@
 import numpy as np
+import logging
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import make_pipeline
@@ -7,6 +8,8 @@ from libpysal.weights import KNN
 from esda.moran import Moran
 from scipy.stats import shapiro, norm as _scipy_norm
 from scipy.interpolate import interp1d as _interp1d
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -254,7 +257,8 @@ def check_normality(Z: np.ndarray, alpha: float = 0.05) -> dict:
 
     try:
         sw_stat, sw_p = shapiro(Z_sw)
-    except Exception:
+    except Exception as e:
+        logger.warning("Shapiro-Wilk test failed: %s", e)
         sw_stat, sw_p = float("nan"), float("nan")
 
     sk   = float(skew(Z))
@@ -329,7 +333,8 @@ def analyze_trend(X, Y, Z, order: int = 1):
         mi      = Moran(Z, w)
         moran_i = float(mi.I)
         moran_p = float(mi.p_sim)
-    except Exception:
+    except Exception as e:
+        logger.warning("Moran's I calculation failed: %s", e)
         moran_i = np.nan
         moran_p = np.nan
 
