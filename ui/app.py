@@ -616,11 +616,16 @@ class App(tk.Tk):
             return
         if self._opt_runner and self._opt_runner.params:
             params = self._opt_runner.params
+            cv     = getattr(self._opt_runner, "cv_summary", None)
             mode   = self.state.get("engine_mode", "kriging")
             if mode == "kriging":
                 self._kriging_panel.populate_from_params(params)
+                if cv:
+                    self._kriging_panel.set_cv_results(cv)
             else:
                 self._gp_panel.populate_from_params(params)
+                if cv:
+                    self._gp_panel.set_cv_results(cv)
             self._log("── Auto Optimize complete — sliders updated ──")
 
     # ─────────────────────────────────────────────────────────────────────────
