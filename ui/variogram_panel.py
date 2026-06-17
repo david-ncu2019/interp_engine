@@ -262,17 +262,32 @@ class KrigingPanel(ttk.Frame):
         self._sv:   Optional[np.ndarray] = None
         self._X_data: Optional[np.ndarray] = None
         self._y_data: Optional[np.ndarray] = None
+        self._dir_cache: Optional[list] = None   # cached directional variogram dicts
+        self._cv_results: Optional[dict] = None  # CV metrics from last Auto Optimize
         self._build_layout()
 
     def _build_layout(self):
-        # ── Left: canvas ──────────────────────────────────────────────────────
+        # ── Left: dashboard sub-tabs ──────────────────────────────────────────
         left = ttk.Frame(self)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
-        self.fig    = Figure(figsize=(5, 3.5), dpi=96, tight_layout=True)
-        self.ax     = self.fig.add_subplot(111)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=left)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._subtabs = ttk.Notebook(left)
+        self._subtabs.pack(fill="both", expand=True)
+
+        self._fit_tab   = SubTabCanvas(self._subtabs)
+        self._dir_tab   = SubTabCanvas(self._subtabs)
+        self._aniso_tab = SubTabCanvas(self._subtabs)
+        self._stats_tab = self._build_stats_tab(self._subtabs)
+
+        self._subtabs.add(self._fit_tab,   text="Variogram Fit")
+        self._subtabs.add(self._dir_tab,   text="Directional 15°")
+        self._subtabs.add(self._aniso_tab, text="Anisotropy Ellipse")
+        self._subtabs.add(self._stats_tab, text="Statistics")
+
+        # primary fit-tab axes (kept as self.ax for the live curve)
+        self.fig = self._fit_tab.fig
+        self.ax  = self.fig.add_subplot(111)
+        self.canvas = self._fit_tab.canvas
         self._init_plot()
 
         # ── Right: controls ───────────────────────────────────────────────────
@@ -341,6 +356,36 @@ class KrigingPanel(ttk.Frame):
         self.columnconfigure(1, weight=2)
         self.rowconfigure(0, weight=1)
 
+    def _build_stats_tab(self, parent):
+        """Statistics sub-tab: parameter summary + CV results (text) + export."""
+        frame = ttk.Frame(parent)
+
+        self._stats_text = tk.Text(
+            frame, height=20, state="disabled", wrap="word",
+            font=("Consolas", 10), background="#f8f8f8", relief="flat")
+        vsb = ttk.Scrollbar(frame, orient="vertical",
+                            command=self._stats_text.yview)
+        self._stats_text.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._stats_text.pack(fill="both", expand=True)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill="x", pady=(2, 0))
+        ttk.Button(btn_frame, text="Export…",
+                   command=self._export_stats).pack(side="right", padx=4)
+        return frame
+
+    def _export_stats(self):
+        path = filedialog.asksaveasfilename(
+            title="Export statistics",
+            defaultextension=".txt",
+            filetypes=[("Text file", "*.txt"), ("CSV file", "*.csv")],
+        )
+        if path:
+            content = self._stats_text.get("1.0", "end")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+
     def _init_plot(self):
         self.ax.clear()
         self.ax.set_xlabel("Lag distance", fontsize=9)
@@ -376,6 +421,7 @@ class KrigingPanel(ttk.Frame):
         self._range_sl.set(max_lag * 0.5)
         self._sill_sl.set(data_var)
         self._nugget_sl.set(0.0)
+        self._compute_directional()
         self._on_param_change()
 
     def _on_nlags_change(self):
@@ -383,7 +429,7 @@ class KrigingPanel(ttk.Frame):
         self._recompute_variogram()
 
     def _on_param_change(self):
-        """Redraw only the model curve overlay — empirical dots stay fixed."""
+        """Slider/model change → refresh every dashboard sub-tab."""
         model = self._model_var.get()
         _, has_alpha = VARIOGRAM_MODELS.get(model, (_spherical, False))
         if has_alpha:
@@ -391,7 +437,10 @@ class KrigingPanel(ttk.Frame):
         else:
             self._alpha_sl.grid_remove()
 
-        self._redraw_curve()
+        self._redraw_curve()        # Variogram Fit tab
+        self._redraw_directional()  # Directional 15° tab
+        self._redraw_anisotropy()   # Anisotropy Ellipse tab
+        self._update_stats()        # Statistics tab
         self._push_to_state()
 
     def _redraw_curve(self):
@@ -418,6 +467,131 @@ class KrigingPanel(ttk.Frame):
             self.ax.legend(fontsize=8)
 
         self.canvas.draw_idle()
+
+    def _compute_directional(self):
+        """Compute 12 directional empirical variograms (15° intervals) and cache them."""
+        if self._X_data is None:
+            self._dir_cache = None
+            return
+        from utils import compute_empirical_variogram as utils_variogram
+        directions = list(range(0, 180, 15))  # 0,15,…,165 → 12 directions
+        n_lags = self._nlags_var.get()
+        try:
+            self._dir_cache = utils_variogram(
+                self._X_data, self._y_data,
+                n_lags=n_lags, directions=directions)
+        except Exception:
+            self._dir_cache = None
+
+    def _redraw_directional(self):
+        """Plot the 12 directional empirical variograms (points only, no model)."""
+        import matplotlib.pyplot as plt
+        fig = self._dir_tab.fig
+        fig.clear()
+        ax = fig.add_subplot(111)
+        if not self._dir_cache:
+            ax.set_title("Directional Variograms (load data first)", fontsize=10)
+            self._dir_tab.canvas.draw_idle()
+            return
+        cmap = plt.cm.tab20
+        n = len(self._dir_cache)
+        for i, dv in enumerate(self._dir_cache):
+            valid = dv["n_pairs"] > 0
+            ax.plot(dv["lags"][valid], dv["semivariance"][valid], "o-",
+                    color=cmap(i / max(n, 1)), ms=4, lw=1.2,
+                    label=f"{dv['direction']:.0f}°")
+        ax.set_xlabel("Lag distance", fontsize=9)
+        ax.set_ylabel("Semivariance", fontsize=9)
+        ax.set_title("Directional Variograms (15° intervals)", fontsize=10)
+        ax.tick_params(labelsize=8)
+        ax.grid(True, ls=":", alpha=0.4)
+        ax.legend(fontsize=7, ncol=3, loc="upper left")
+        self._dir_tab.canvas.draw_idle()
+
+    def _redraw_anisotropy(self):
+        """Polar rose of empirical range-per-direction + live fitted ellipse."""
+        fig = self._aniso_tab.fig
+        fig.clear()
+        ax = fig.add_subplot(111, projection="polar")
+
+        # Empirical range per direction: lag where γ first reaches 95% of its max
+        if self._dir_cache:
+            angles_deg, ranges = [], []
+            for dv in self._dir_cache:
+                valid = dv["n_pairs"] > 0
+                lags_v = dv["lags"][valid]
+                sv_v = dv["semivariance"][valid]
+                if len(lags_v) < 3:
+                    continue
+                target = 0.95 * float(np.max(sv_v))
+                above = np.where(sv_v >= target)[0]
+                est = float(lags_v[above[0]]) if len(above) else float(lags_v[-1])
+                angles_deg.append(dv["direction"])
+                ranges.append(est)
+            if angles_deg:
+                a = np.array(angles_deg, dtype=float)
+                r = np.array(ranges, dtype=float)
+                # mirror to full circle (variograms are symmetric ±180°)
+                a_full = np.deg2rad(np.concatenate([a, a + 180.0]))
+                r_full = np.concatenate([r, r])
+                order = np.argsort(a_full)
+                a_full, r_full = a_full[order], r_full[order]
+                a_full = np.append(a_full, a_full[0])    # close polygon
+                r_full = np.append(r_full, r_full[0])
+                ax.plot(a_full, r_full, "o-", color="steelblue", ms=4, lw=1.5,
+                        label="Empirical range")
+                ax.fill(a_full, r_full, color="steelblue", alpha=0.15)
+
+        # Live fitted anisotropy ellipse from current sliders
+        r_major = max(self._range_sl.get(), 1e-6)
+        ratio = max(self._aniso_sl.get(), 1.0)
+        r_minor = r_major / ratio
+        ang = np.deg2rad(self._angle_sl.get())
+        theta = np.linspace(0, 2 * np.pi, 240)
+        denom = np.sqrt((r_minor * np.cos(theta - ang)) ** 2
+                        + (r_major * np.sin(theta - ang)) ** 2)
+        r_ell = (r_major * r_minor) / np.where(denom == 0, 1e-9, denom)
+        ax.plot(theta, r_ell, "r-", lw=2, label="Fitted ellipse")
+
+        ax.set_title("Anisotropy Rose Diagram", fontsize=10, pad=14)
+        ax.tick_params(labelsize=7)
+        ax.legend(fontsize=7, loc="upper right", bbox_to_anchor=(1.28, 1.10))
+        self._aniso_tab.canvas.draw_idle()
+
+    def _update_stats(self):
+        """Refresh the Statistics sub-tab text (params now, CV after optimize)."""
+        self._stats_text.configure(state="normal")
+        self._stats_text.delete("1.0", "end")
+        model = self._model_var.get()
+        lines = ["=== Current Variogram Parameters ===", ""]
+        lines.append(f"  Model            : {model}")
+        lines.append(f"  Range            : {self._range_sl.get():.4f}")
+        lines.append(f"  Sill (psill)     : {self._sill_sl.get():.4f}")
+        lines.append(f"  Nugget           : {self._nugget_sl.get():.4f}")
+        lines.append(f"  Angle (deg)      : {self._angle_sl.get():.1f}")
+        lines.append(f"  Anisotropy ratio : {self._aniso_sl.get():.2f}")
+        _, has_alpha = VARIOGRAM_MODELS.get(model, (None, False))
+        if has_alpha:
+            lines.append(f"  Alpha            : {self._alpha_sl.get():.3f}")
+        lines.append(f"  Number of lags   : {self._nlags_var.get()}")
+        lines.append("")
+        if self._cv_results:
+            lines.append("=== Cross-Validation (last Auto Optimize) ===")
+            lines.append("")
+            for k, val in self._cv_results.items():
+                if isinstance(val, float):
+                    lines.append(f"  {k:16s} : {val:.4f}")
+                else:
+                    lines.append(f"  {k:16s} : {val}")
+        else:
+            lines.append("  (Run Auto Optimize to populate CV results)")
+        self._stats_text.insert("1.0", "\n".join(lines))
+        self._stats_text.configure(state="disabled")
+
+    def set_cv_results(self, results: dict):
+        """Called by app.py after Auto Optimize completes."""
+        self._cv_results = results
+        self._update_stats()
 
     def _push_to_state(self):
         model = self._model_var.get()
@@ -448,6 +622,13 @@ class KrigingPanel(ttk.Frame):
             self._aniso_sl.set(params["anisotropy_ratio"])
         if "alpha" in params:
             self._alpha_sl.set(params["alpha"])
+        cv = {}
+        if "cv_rmse" in params:
+            cv["RMSE"] = params["cv_rmse"]
+        if "cv_mean_sspe" in params:
+            cv["Mean SSPE"] = params["cv_mean_sspe"]
+        if cv:
+            self._cv_results = cv
         self._on_param_change()
 
     def _reset_defaults(self):
