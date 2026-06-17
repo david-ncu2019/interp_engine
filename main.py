@@ -233,6 +233,22 @@ def run_pipeline():
     out_cfg = config.get("output", {})
     scenario_name = Path(config["input"]["filepath"]).stem
 
+    # ── UI mode ──────────────────────────────────────────────────────────────
+    # When the desktop UI runs a full prediction it sets ui_mode + a private
+    # bundle_dir. In that mode we write NOTHING to the user's output folder:
+    # diagnostics PNGs and the grid/point export are suppressed, and the data
+    # the UI needs (grid arrays, CV results, params) goes to the temp bundle.
+    # The user's own output is produced only when they click Export.
+    ui_mode = bool(out_cfg.get("ui_mode", False))
+    bundle_dir = None
+    if ui_mode:
+        from pathlib import Path as _Path
+        bundle_dir = _Path(out_cfg.get("bundle_dir") or (out_dir / "_ui_bundle"))
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        out_cfg = {**out_cfg, "save_diagnostics": False}  # skip all A–I PNGs
+    # Directory that receives CV csv / params json (bundle in UI mode, else out_dir)
+    _diag_dir = bundle_dir if ui_mode else out_dir
+
     print("=" * 60)
     print(f"  Interpolation Engine  –  {scenario_name}")
     print("=" * 60)
@@ -533,7 +549,7 @@ def run_pipeline():
     for k, v in params.items():
         print(f"       {k:30s}: {v}")
 
-    save_parameter_summary(params, mode, out_dir)
+    save_parameter_summary(params, mode, _diag_dir)
 
     # ── 6. Predict ────────────────────────────────────────────
     if is_point_mode:
@@ -571,6 +587,15 @@ def run_pipeline():
         else:
             pred_mean.flat[mask] = means
             pred_std.flat[mask] = stds
+
+    # ── UI mode: dump the grid arrays the Workspace needs to render ─────
+    if ui_mode and not is_point_mode:
+        np.savez_compressed(
+            bundle_dir / "grid.npz",
+            mean=pred_mean, std=pred_std, xv=X_grid, yv=Y_grid,
+            X_obs=X_coord, Y_obs=Y_coord,
+            hull=(hull_verts if hull_verts is not None else np.empty((0, 2))),
+        )
 
     # ── 7. Diagnostics & export ───────────────────────────────────────
     print("[7/7] Generating outputs ...")
@@ -650,20 +675,21 @@ def run_pipeline():
             print(f"       ✓ H_comparison_{mode}.png")
 
     # I_ Cross-validation dashboard
-    if out_cfg.get("save_diagnostics", True):
+    if out_cfg.get("save_diagnostics", True) or ui_mode:
         print("       Running cross-validation ...")
         if mode == "gp":
             cv_df = perform_gpr_kfold_cv(model, X, Z_fit, nst=nst)
         else:
             cv_df = perform_kriging_kfold_cv(model, X, Z_fit, nst=nst)
-        cv_df.to_csv(out_dir / f"cv_results_{mode}.csv", index=False)
-        plot_cv_dashboard(
-            cv_df,
-            engine_name=mode.upper(),
-            scenario_name=scenario_name,
-            save_path=out_dir / f"I_cv_dashboard_{mode}.png",
-        )
-        print(f"       ✓ I_cv_dashboard_{mode}.png")
+        cv_df.to_csv(_diag_dir / f"cv_results_{mode}.csv", index=False)
+        if not ui_mode:
+            plot_cv_dashboard(
+                cv_df,
+                engine_name=mode.upper(),
+                scenario_name=scenario_name,
+                save_path=out_dir / f"I_cv_dashboard_{mode}.png",
+            )
+            print(f"       ✓ I_cv_dashboard_{mode}.png")
         print(f"       ✓ cv_results_{mode}.csv")
         
         # Calculate and print evaluation metrics
@@ -673,6 +699,15 @@ def run_pipeline():
         mae = mean_absolute_error(obs, pred)
         rmse = np.sqrt(mean_squared_error(obs, pred))
         r2 = r2_score(obs, pred)
+
+        # Calibration of the predictive variance via standardized residuals:
+        #   SSPE_i  = Z_i²            (Z = (obs − pred) / kriging-or-GP std)
+        #   mean_SSPE = mean(Z²)  → ≈ 1.0 when the stated uncertainty is honest
+        #   RMSS      = √mean_SSPE
+        # mean_SSPE > 1 → over-confident (uncertainty too small); < 1 → conservative.
+        _z = cv_df['Z_Score'].to_numpy()
+        mean_sspe = float(np.mean(_z ** 2)) if len(_z) else float('nan')
+        rmss = float(np.sqrt(mean_sspe)) if np.isfinite(mean_sspe) else float('nan')
 
         # ── Theoretical R² ceiling from nugget ratio ──────────────────────
         # The nugget (C₀) represents variance that no spatial model can ever
@@ -727,6 +762,8 @@ def run_pipeline():
         print(f"       MAE        : {mae:.4f}")
         print(f"       RMSE       : {rmse:.4f}")
         print(f"       R²         : {r2:.4f}")
+        print(f"       mean_SSPE  : {mean_sspe:.4f}  (~1 = well-calibrated variance)")
+        print(f"       RMSS       : {rmss:.4f}")
         if not _sanity_ok:
             print(f"       ⚠  Metrics above are flagged as unreliable (see warnings).")
         if r2_ceiling is not None:
@@ -741,7 +778,15 @@ def run_pipeline():
             else:
                 print(f"       ↑ Gap to ceiling: {gap:.4f} — consider data density / model selection.")
 
-    # Export
+    # Export — skipped entirely in UI mode (the UI exports on demand).
+    if ui_mode:
+        print(f"[ui-bundle] {bundle_dir}")
+        print("\n" + "=" * 60)
+        print(f"  UI run complete — results staged in bundle (no files written "
+              f"to the output folder).")
+        print("=" * 60)
+        return
+
     requested_formats = out_cfg.get("formats", None)
 
     if is_point_mode:

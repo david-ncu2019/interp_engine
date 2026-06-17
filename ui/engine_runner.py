@@ -34,6 +34,9 @@ MAIN_PY      = PROJECT_ROOT / "main.py"
 _CV_RE = re.compile(
     r"\[fast-opt\] CV done in [\d.]+s: RMSE=([\d.]+), mean_SSPE=([\d.]+)")
 
+# Matches main.py's UI-mode bundle line, e.g.  [ui-bundle] C:\Temp\interp_uirun_x
+_BUNDLE_RE = re.compile(r"^\[ui-bundle\]\s+(.+)$")
+
 # Set True while debugging; flip to False once all errors are resolved
 VERBOSE = True
 
@@ -144,6 +147,8 @@ def build_config(state: dict) -> dict:
         "netcdf_z_dim_name": state.get("netcdf_z_dim_name", "Depth"),
         "save_diagnostics":  state.get("save_diagnostics", True),
         "formats":           state.get("export_formats", ["nc"]),
+        "ui_mode":           state.get("ui_mode", False),
+        "bundle_dir":        state.get("bundle_dir"),
     }
 
     return cfg
@@ -178,6 +183,7 @@ class EngineRunner:
         self.log_queue  = log_queue
         self.result: Optional[dict] = None   # populated on success
         self.error:  Optional[str]  = None   # populated on failure
+        self.bundle_dir: Optional[str] = None  # temp dir with grid.npz/cv/params
         self._proc:  Optional[subprocess.Popen] = None
         self._thread: Optional[threading.Thread] = None
         self.start_time: Optional[float] = None
@@ -196,6 +202,10 @@ class EngineRunner:
             self._proc.terminate()
 
     def _run(self):
+        # Full UI runs go to a private temp bundle (no files in the user's
+        # output folder); the Workspace reads grid.npz/cv/params back from it.
+        self.bundle_dir = tempfile.mkdtemp(prefix="interp_uirun_")
+        self.state = {**self.state, "ui_mode": True, "bundle_dir": self.bundle_dir}
         config_path = write_temp_config(self.state)
         if VERBOSE:
             self.log_queue.put(f"[VERBOSE] config written → {config_path}")
@@ -226,6 +236,9 @@ class EngineRunner:
                 _tail.append(stripped)
                 if len(_tail) > 30:
                     _tail.pop(0)
+                _bm = _BUNDLE_RE.match(stripped)
+                if _bm:
+                    self.bundle_dir = _bm.group(1).strip()
             self._proc.wait()
             self.elapsed = time.time() - self.start_time
             if VERBOSE:
@@ -249,12 +262,47 @@ class EngineRunner:
             self.log_queue.put(None)  # sentinel: run finished
 
     def _parse_results(self) -> dict:
-        """Read parameters JSON and cv_results CSV from the output directory."""
+        """Read results. In UI mode, load the temp bundle (grid.npz + cv csv +
+        params json); otherwise read the engine's output directory."""
         from pathlib import Path
         import csv
 
         state   = self.state
         mode    = state.get("engine_mode", "kriging")
+
+        # ── UI mode: load everything the Workspace needs from the bundle ──
+        if self.bundle_dir:
+            import json as _json
+            import numpy as _np
+            bdir = Path(self.bundle_dir)
+            result: dict = {"mode": mode, "elapsed": self.elapsed,
+                            "bundle_dir": str(bdir)}
+            grid_file = bdir / "grid.npz"
+            if grid_file.exists():
+                with _np.load(grid_file) as gz:
+                    result["grid"] = {k: gz[k] for k in gz.files}
+            params_file = bdir / f"parameters_{mode}.json"
+            if params_file.exists():
+                with open(params_file) as f:
+                    result["params"] = _json.load(f)
+            cv_file = bdir / f"cv_results_{mode}.csv"
+            if cv_file.exists():
+                import pandas as _pd
+                cv_df = _pd.read_csv(cv_file)
+                result["cv_df"] = cv_df
+                if {"Observed", "Predicted"}.issubset(cv_df.columns):
+                    resid = cv_df["Observed"] - cv_df["Predicted"]
+                    result["mae"] = float(resid.abs().mean())
+                    result["rmse"] = float((resid ** 2).mean() ** 0.5)
+                    ss_res = float((resid ** 2).sum())
+                    ss_tot = float(((cv_df["Observed"] - cv_df["Observed"].mean()) ** 2).sum())
+                    result["r2"] = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+                if "Z_Score" in cv_df.columns:
+                    z = cv_df["Z_Score"].to_numpy()
+                    result["mean_sspe"] = float(_np.mean(z ** 2)) if len(z) else float("nan")
+                    result["rmss"] = float(_np.sqrt(result["mean_sspe"]))
+            return result
+
         out_dir = Path(state.get("output_dir", "output"))
 
         # output is written to {base_dir}/{input_stem}/
