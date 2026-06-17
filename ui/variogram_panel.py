@@ -16,6 +16,14 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
+from tkinter import filedialog
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Variogram model functions  (γ(h) formulas)
@@ -206,6 +214,35 @@ class LabeledSlider(ttk.Frame):
 
     def configure_range(self, from_: float, to: float):
         self._slider.configure(from_=from_, to=to)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sub-tab canvas: a Figure + canvas + Export button, for one dashboard tab
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SubTabCanvas(ttk.Frame):
+    """One dashboard sub-tab: a matplotlib Figure, its canvas, and an Export button."""
+
+    def __init__(self, parent, figsize=(6.0, 4.2), dpi=96, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.fig = Figure(figsize=figsize, dpi=dpi, tight_layout=True)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill="x", pady=(2, 0))
+        ttk.Button(btn_frame, text="Export…", command=self._export).pack(
+            side="right", padx=4)
+
+    def _export(self):
+        path = filedialog.asksaveasfilename(
+            title="Export plot",
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("SVG vector", "*.svg"),
+                       ("PDF document", "*.pdf")],
+        )
+        if path:
+            self.fig.savefig(path, dpi=150, bbox_inches="tight")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
