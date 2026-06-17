@@ -12,6 +12,7 @@ Responsibilities
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,11 @@ import yaml
 # ── Root of the project (parent of ui/) ───────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MAIN_PY      = PROJECT_ROOT / "main.py"
+
+# Matches the fast optimizer's single CV line, e.g.
+#   [fast-opt] CV done in 2.13s: RMSE=0.4521, mean_SSPE=0.987
+_CV_RE = re.compile(
+    r"\[fast-opt\] CV done in [\d.]+s: RMSE=([\d.]+), mean_SSPE=([\d.]+)")
 
 # Set True while debugging; flip to False once all errors are resolved
 VERBOSE = True
@@ -299,11 +305,12 @@ class AutoOptimizeRunner:
     """
 
     def __init__(self, state: dict, log_queue: "queue.Queue[str]"):
-        self.state     = state
-        self.log_queue = log_queue
-        self.params:   Optional[dict] = None
-        self.error:    Optional[str]  = None
-        self._thread:  Optional[threading.Thread] = None
+        self.state      = state
+        self.log_queue  = log_queue
+        self.params:     Optional[dict] = None
+        self.cv_summary: Optional[dict] = None
+        self.error:      Optional[str]  = None
+        self._thread:    Optional[threading.Thread] = None
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -359,6 +366,12 @@ class AutoOptimizeRunner:
                 _tail.append(stripped)
                 if len(_tail) > 30:
                     _tail.pop(0)
+                _m = _CV_RE.search(stripped)
+                if _m:
+                    self.cv_summary = {
+                        "RMSE": float(_m.group(1)),
+                        "Mean SSPE": float(_m.group(2)),
+                    }
             proc.wait()
             if VERBOSE:
                 self.log_queue.put(f"[VERBOSE] returncode: {proc.returncode}")
