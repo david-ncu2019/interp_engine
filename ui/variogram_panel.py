@@ -662,17 +662,33 @@ class GPPanel(ttk.Frame):
         self.state = state
         self._lags: Optional[np.ndarray] = None
         self._sv:   Optional[np.ndarray] = None
+        self._X_data: Optional[np.ndarray] = None
+        self._y_data: Optional[np.ndarray] = None
+        self._dir_cache: Optional[list] = None
+        self._cv_results: Optional[dict] = None
         self._build_layout()
 
     def _build_layout(self):
-        # ── Left: reference variogram ──────────────────────────────────────────
+        # ── Left: dashboard sub-tabs ──────────────────────────────────────────
         left = ttk.Frame(self)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
-        self.fig    = Figure(figsize=(5, 3.5), dpi=96, tight_layout=True)
-        self.ax     = self.fig.add_subplot(111)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=left)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._subtabs = ttk.Notebook(left)
+        self._subtabs.pack(fill="both", expand=True)
+
+        self._fit_tab   = SubTabCanvas(self._subtabs)
+        self._dir_tab   = SubTabCanvas(self._subtabs)
+        self._aniso_tab = SubTabCanvas(self._subtabs)
+        self._stats_tab = self._build_stats_tab(self._subtabs)
+
+        self._subtabs.add(self._fit_tab,   text="Empirical Variogram")
+        self._subtabs.add(self._dir_tab,   text="Directional 15°")
+        self._subtabs.add(self._aniso_tab, text="Anisotropy Ellipse")
+        self._subtabs.add(self._stats_tab, text="Statistics")
+
+        self.fig = self._fit_tab.fig
+        self.ax  = self.fig.add_subplot(111)
+        self.canvas = self._fit_tab.canvas
         self._init_plot()
 
         # ── Right: controls ───────────────────────────────────────────────────
@@ -692,7 +708,7 @@ class GPPanel(ttk.Frame):
         ]:
             ttk.Radiobutton(
                 right, text=klabel, variable=self._kernel_var, value=kname,
-                command=self._push_to_state,
+                command=self._on_param_change,
             ).grid(row=row, column=0, columnspan=2, sticky="w")
             row += 1
 
@@ -701,11 +717,11 @@ class GPPanel(ttk.Frame):
         row += 1
 
         self._ls_sl    = LabeledSlider(right, "Length scale:", 1, 5000, 500,
-                                        on_change=self._push_to_state)
+                                        on_change=self._on_param_change)
         self._aniso_sl = LabeledSlider(right, "Anisotropy ×:", 1, 15, 1,
-                                        on_change=self._push_to_state)
+                                        on_change=self._on_param_change)
         self._angle_sl = LabeledSlider(right, "Angle (°):",    0, 180, 0,
-                                        on_change=self._push_to_state)
+                                        on_change=self._on_param_change)
 
         for sl in [self._ls_sl, self._aniso_sl, self._angle_sl]:
             sl.grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
@@ -727,6 +743,134 @@ class GPPanel(ttk.Frame):
         self.columnconfigure(1, weight=2)
         self.rowconfigure(0, weight=1)
 
+    def _build_stats_tab(self, parent):
+        frame = ttk.Frame(parent)
+        self._stats_text = tk.Text(
+            frame, height=20, state="disabled", wrap="word",
+            font=("Consolas", 10), background="#f8f8f8", relief="flat")
+        vsb = ttk.Scrollbar(frame, orient="vertical",
+                            command=self._stats_text.yview)
+        self._stats_text.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._stats_text.pack(fill="both", expand=True)
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill="x", pady=(2, 0))
+        ttk.Button(btn_frame, text="Export…",
+                   command=self._export_stats).pack(side="right", padx=4)
+        return frame
+
+    def _export_stats(self):
+        path = filedialog.asksaveasfilename(
+            title="Export statistics", defaultextension=".txt",
+            filetypes=[("Text file", "*.txt"), ("CSV file", "*.csv")])
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self._stats_text.get("1.0", "end"))
+
+    def _on_param_change(self, *_):
+        self._redraw_anisotropy()
+        self._update_stats()
+        self._push_to_state()
+
+    def _compute_directional(self):
+        if self._X_data is None:
+            self._dir_cache = None
+            return
+        from utils import compute_empirical_variogram as utils_variogram
+        try:
+            self._dir_cache = utils_variogram(
+                self._X_data, self._y_data,
+                n_lags=15, directions=list(range(0, 180, 15)))
+        except Exception:
+            self._dir_cache = None
+
+    def _redraw_directional(self):
+        import matplotlib.pyplot as plt
+        fig = self._dir_tab.fig
+        fig.clear()
+        ax = fig.add_subplot(111)
+        if not self._dir_cache:
+            ax.set_title("Directional Variograms (load data first)", fontsize=10)
+            self._dir_tab.canvas.draw_idle()
+            return
+        cmap = plt.cm.tab20
+        n = len(self._dir_cache)
+        for i, dv in enumerate(self._dir_cache):
+            valid = dv["n_pairs"] > 0
+            ax.plot(dv["lags"][valid], dv["semivariance"][valid], "o-",
+                    color=cmap(i / max(n, 1)), ms=4, lw=1.2,
+                    label=f"{dv['direction']:.0f}°")
+        ax.set_xlabel("Lag distance", fontsize=9)
+        ax.set_ylabel("Semivariance", fontsize=9)
+        ax.set_title("Directional Variograms (15° intervals)", fontsize=10)
+        ax.tick_params(labelsize=8)
+        ax.grid(True, ls=":", alpha=0.4)
+        ax.legend(fontsize=7, ncol=3, loc="upper left")
+        self._dir_tab.canvas.draw_idle()
+
+    def _redraw_anisotropy(self):
+        fig = self._aniso_tab.fig
+        fig.clear()
+        ax = fig.add_subplot(111, projection="polar")
+        if self._dir_cache:
+            angles_deg, ranges = [], []
+            for dv in self._dir_cache:
+                valid = dv["n_pairs"] > 0
+                lags_v = dv["lags"][valid]; sv_v = dv["semivariance"][valid]
+                if len(lags_v) < 3:
+                    continue
+                target = 0.95 * float(np.max(sv_v))
+                above = np.where(sv_v >= target)[0]
+                est = float(lags_v[above[0]]) if len(above) else float(lags_v[-1])
+                angles_deg.append(dv["direction"]); ranges.append(est)
+            if angles_deg:
+                a = np.array(angles_deg, float); r = np.array(ranges, float)
+                a_full = np.deg2rad(np.concatenate([a, a + 180.0]))
+                r_full = np.concatenate([r, r])
+                order = np.argsort(a_full)
+                a_full, r_full = a_full[order], r_full[order]
+                a_full = np.append(a_full, a_full[0]); r_full = np.append(r_full, r_full[0])
+                ax.plot(a_full, r_full, "o-", color="steelblue", ms=4, lw=1.5,
+                        label="Empirical range")
+                ax.fill(a_full, r_full, color="steelblue", alpha=0.15)
+        r_major = max(self._ls_sl.get(), 1e-6)
+        ratio = max(self._aniso_sl.get(), 1.0)
+        r_minor = r_major / ratio
+        ang = np.deg2rad(self._angle_sl.get())
+        theta = np.linspace(0, 2 * np.pi, 240)
+        denom = np.sqrt((r_minor * np.cos(theta - ang)) ** 2
+                        + (r_major * np.sin(theta - ang)) ** 2)
+        r_ell = (r_major * r_minor) / np.where(denom == 0, 1e-9, denom)
+        ax.plot(theta, r_ell, "r-", lw=2, label="Length-scale ellipse")
+        ax.set_title("Anisotropy Rose Diagram", fontsize=10, pad=14)
+        ax.tick_params(labelsize=7)
+        ax.legend(fontsize=7, loc="upper right", bbox_to_anchor=(1.28, 1.10))
+        self._aniso_tab.canvas.draw_idle()
+
+    def _update_stats(self):
+        self._stats_text.configure(state="normal")
+        self._stats_text.delete("1.0", "end")
+        lines = ["=== Current GP Kernel Parameters ===", ""]
+        lines.append(f"  Kernel type      : {self._kernel_var.get()}")
+        lines.append(f"  Length scale     : {self._ls_sl.get():.4f}")
+        lines.append(f"  Anisotropy ratio : {self._aniso_sl.get():.2f}")
+        lines.append(f"  Angle (deg)      : {self._angle_sl.get():.1f}")
+        lines.append("")
+        if self._cv_results:
+            lines.append("=== Cross-Validation (last Auto Optimize) ===")
+            lines.append("")
+            for k, val in self._cv_results.items():
+                lines.append(f"  {k:16s} : {val:.4f}" if isinstance(val, float)
+                             else f"  {k:16s} : {val}")
+        else:
+            lines.append("  (Run Auto Optimize to populate CV results)")
+        self._stats_text.insert("1.0", "\n".join(lines))
+        self._stats_text.configure(state="disabled")
+
+    def set_cv_results(self, results: dict):
+        self._cv_results = results
+        self._update_stats()
+
     def _init_plot(self):
         self.ax.clear()
         self.ax.set_xlabel("Lag distance", fontsize=9)
@@ -736,6 +880,8 @@ class GPPanel(ttk.Frame):
         self.canvas.draw_idle()
 
     def load_data(self, X: np.ndarray, y: np.ndarray):
+        self._X_data = np.asarray(X, dtype=float)
+        self._y_data = np.asarray(y, dtype=float)
         self._lags, self._sv = compute_empirical_variogram(X, y)
         if len(self._lags) == 0:
             return
@@ -745,6 +891,10 @@ class GPPanel(ttk.Frame):
         self._ls_sl.set(max_lag * 0.5)
         self._aniso_sl.configure_range(1, float(self.state.get("gp_max_anisotropy", 15)))
         self._redraw_empirical()
+        self._compute_directional()
+        self._redraw_directional()
+        self._redraw_anisotropy()
+        self._update_stats()
         self._push_to_state()
 
     def _redraw_empirical(self):
@@ -781,7 +931,15 @@ class GPPanel(ttk.Frame):
                 self._aniso_sl.set(min(ratio, 15))
         if "rotation_angle_deg" in params:
             self._angle_sl.set(params["rotation_angle_deg"])
+        cv = {}
+        if "cv_rmse" in params:
+            cv["RMSE"] = params["cv_rmse"]
+        if "cv_mean_sspe" in params:
+            cv["Mean SSPE"] = params["cv_mean_sspe"]
+        if cv:
+            self._cv_results = cv
         self._push_to_state()
+        self._update_stats()
 
     def _reset_defaults(self):
         self._kernel_var.set("matern_52")
