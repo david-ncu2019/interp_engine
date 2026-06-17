@@ -48,6 +48,14 @@ def matern52_variogram_model(params, dists):
     u = np.sqrt(5.0) * dists / r
     return psill * (1.0 - (1.0 + u + u**2 / 3.0) * np.exp(-u)) + nugget
 
+def linear_variogram_model(params, dists):
+    psill, r, nugget = params
+    return nugget + np.minimum(psill * dists / r, psill)
+
+def power_variogram_model(params, dists):
+    psill, r, nugget = params
+    return nugget + psill * (dists / r)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Variogram evaluators for WLS fitting — γ(h) given (h, psill, range, nugget)
@@ -187,13 +195,15 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
       - fit(): Legacy Optuna TPE stochastic search (backward compatibility).
     """
 
-    NATIVE_MODELS = ['linear', 'power', 'gaussian', 'spherical', 'exponential', 'hole-effect']
+    NATIVE_MODELS = ['gaussian', 'spherical', 'exponential', 'hole-effect']
     CUSTOM_MODELS = {
         'stable': stable_variogram_model,
         'circular': circular_variogram_model,
         'rational-quadratic': rational_quadratic_variogram_model,
         'matern_32': matern32_variogram_model,
         'matern_52': matern52_variogram_model,
+        'linear': linear_variogram_model,
+        'power': power_variogram_model,
     }
 
     _MIN_TRIALS_RECOMMENDED = 100
