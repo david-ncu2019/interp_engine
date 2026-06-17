@@ -504,6 +504,56 @@ class RotatedGPR(BaseEstimator, RegressorMixin):
         print(f"       [GP post-fit] nugget variance             : {nugget:.6f}")
         print(f"       [GP post-fit] jitter alpha                : {self.best_alpha_:.6f}")
 
+    def fit_with_known_params(self, X: np.ndarray, y: np.ndarray, preset: dict) -> "RotatedGPR":
+        """Fit directly from UI-supplied parameters — skips Optuna and L-BFGS-B."""
+        self.X_train_ = np.asarray(X, dtype=np.float64)
+        self.y_train_ = np.asarray(y, dtype=np.float64)
+
+        if self.center_coords:
+            self.X_train_centered_, self.X_center_ = self._center_coordinates(self.X_train_)
+        else:
+            self.X_train_centered_ = self.X_train_
+            self.X_center_         = np.zeros(2)
+
+        kernel_type   = preset.get("kernel_type", "matern_52")
+        angle_deg     = float(preset.get("angle_deg", 0.0))
+        ls_major      = float(preset.get("length_scale_major", self.ls_init))
+        aniso_ratio   = float(preset.get("anisotropy_ratio", 1.0))
+        ls_minor      = ls_major / max(aniso_ratio, 1e-6)
+        signal_var    = float(preset.get("signal_variance", float(np.var(y))))
+        nugget        = float(preset.get("nugget_variance", self.nugget_init))
+        alpha         = float(preset.get("jitter_alpha", 1e-6))
+
+        base_k = build_base_kernel(kernel_type, ls_major, self.ls_bounds)
+        base_k.length_scale = [ls_major, ls_minor]
+
+        kernel = ConstantKernel(
+            constant_value=signal_var,
+            constant_value_bounds=self.var_bounds,
+        ) * base_k + WhiteKernel(
+            noise_level=nugget,
+            noise_level_bounds=self.nugget_bounds,
+        )
+
+        self.best_angle_deg_   = angle_deg
+        self.best_kernel_type_ = kernel_type
+        self.best_alpha_       = alpha
+
+        X_rot = self._rotate_coords(self.X_train_centered_, angle_deg)
+        self.gp_model_ = GaussianProcessRegressor(
+            kernel=kernel, alpha=alpha,
+            optimizer=None, normalize_y=True,
+            random_state=self.random_state,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.gp_model_.fit(X_rot, self.y_train_)
+        self.log_marginal_likelihood_ = self.gp_model_.log_marginal_likelihood()
+        print(f"       [GP preset-fit] kernel={kernel_type}, angle={angle_deg:.1f}°, "
+              f"ls={ls_major:.2f}/{ls_minor:.2f}, nugget={nugget:.4e}, "
+              f"LML={self.log_marginal_likelihood_:.4f}")
+        return self
+
     # ── predict ───────────────────────────────────────────────────────────────
 
     def predict(

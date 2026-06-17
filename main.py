@@ -21,6 +21,18 @@ matches the logical viewing sequence:
     parameters_<engine>.txt / .json
     predicted_<engine>.nc
 """
+# ── Force UTF-8 stdout/stderr on Windows ─────────────────────────────────
+# When main.py is launched as a subprocess (e.g. from the UI), stdout is a
+# pipe whose encoding defaults to the Windows locale (cp1252).  Unicode
+# characters (arrows, check marks, warning signs) in print() statements
+# cause UnicodeEncodeError and crash the pipeline.  Reconfiguring to UTF-8
+# ensures all Unicode output is safe regardless of how the process is launched.
+import sys as _sys
+if hasattr(_sys.stdout, "reconfigure"):
+    _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(_sys.stderr, "reconfigure"):
+    _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import yaml
 import json
 from pathlib import Path
@@ -476,7 +488,43 @@ def run_pipeline():
     # ── 5. Fit ────────────────────────────────────────────────────────
     print("[5/7] Fitting model ...")
     t0 = time.time()
-    model.fit(X, Z_fit)
+
+    kriging_preset = (engine_cfg.get("kriging", {}).get("preset_params")
+                      if mode == "kriging" else None)
+    kriging_model  = (engine_cfg.get("kriging", {}).get("model")
+                      if mode == "kriging" else None)
+    kriging_nlags  = (engine_cfg.get("kriging", {}).get("n_lags", 12)
+                      if mode == "kriging" else 12)
+    gp_preset      = (engine_cfg.get("gp", {}).get("preset_params")
+                      if mode == "gp" else None)
+
+    if kriging_preset:
+        print("       [preset] Using UI-supplied variogram parameters — skipping optimization.")
+        model.fit_with_known_params(
+            X, Z_fit,
+            best_model_name=kriging_preset["model"],
+            best_params={
+                "psill":   kriging_preset["psill"],
+                "range":   kriging_preset["range"],
+                "nugget":  kriging_preset["nugget"],
+                "angle":   kriging_preset.get("angle_deg", 0.0),
+                "scaling": kriging_preset.get("anisotropy_ratio", 1.0),
+                **( {"alpha": kriging_preset["alpha"]} if "alpha" in kriging_preset else {} ),
+            },
+        )
+    elif kriging_model:
+        print(f"       [deterministic] Optimizing {kriging_model} with {kriging_nlags} lags ...")
+        model.fit_deterministic(
+            X, Z_fit,
+            model_name=kriging_model,
+            n_lags=kriging_nlags,
+            n_folds=engine_cfg.get("kriging", {}).get("n_splits", 5),
+        )
+    elif gp_preset:
+        print("       [preset] Using UI-supplied GP kernel parameters — skipping Optuna.")
+        model.fit_with_known_params(X, Z_fit, gp_preset)
+    else:
+        model.fit(X, Z_fit)
     elapsed = time.time() - t0
     print(f"       Completed in {elapsed:.2f} s.")
 
@@ -528,7 +576,7 @@ def run_pipeline():
     print("[7/7] Generating outputs ...")
 
     # B_ Convex hull
-    if not is_point_mode:
+    if not is_point_mode and out_cfg.get("save_diagnostics", True):
         plot_convex_hull(
             X_coord, Y_coord, Z_val,
             hull_verts, X_grid, Y_grid, mask,
@@ -548,7 +596,7 @@ def run_pipeline():
 
     if out_cfg.get("save_diagnostics", True):
         # D_ Omnidirectional variogram
-        omni_var = compute_empirical_variogram(X, Z_fit)
+        omni_var = compute_empirical_variogram(X, Z_fit, n_lags=kriging_nlags if mode == "kriging" else None)
         plot_variogram(
             omni_var,
             fitted_params=params,
@@ -577,7 +625,7 @@ def run_pipeline():
         )
         print(f"       ✓ F_anisotropy_ellipse_{mode}.png")
 
-    if not is_point_mode:
+    if not is_point_mode and out_cfg.get("save_diagnostics", True):
         # G_ Prediction surface
         plot_prediction_surface(
             X_grid, Y_grid, pred_mean, pred_std,
@@ -739,4 +787,16 @@ def run_pipeline():
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    import sys
+    import traceback
+    try:
+        run_pipeline()
+    except SystemExit:
+        raise
+    except Exception:
+        print("\n" + "=" * 60, flush=True)
+        print("FATAL: Unhandled exception in run_pipeline()", flush=True)
+        print("=" * 60, flush=True)
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.exit(1)
