@@ -24,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from ui.engine_runner import AutoOptimizeRunner, EngineRunner
 from ui.variogram_panel import KrigingPanel, GPPanel
+from ui.workspace import WorkspacePanel
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -138,15 +139,13 @@ class App(tk.Tk):
         self._notebook = ttk.Notebook(self)
         self._notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self._tab_data    = self._build_tab_data()
-        self._tab_method  = self._build_tab_method()
-        self._tab_model   = self._build_tab_model()
-        self._tab_run     = self._build_tab_run()
+        self._tab_data      = self._build_tab_data()
+        self._tab_method    = self._build_tab_method()
+        self._tab_workspace = self._build_tab_workspace()
 
-        self._notebook.add(self._tab_data,   text=" 1. Data ")
-        self._notebook.add(self._tab_method, text=" 2. Method ")
-        self._notebook.add(self._tab_model,  text=" 3. Model ")
-        self._notebook.add(self._tab_run,    text=" 4. Run & Results ")
+        self._notebook.add(self._tab_data,      text=" 1. Data ")
+        self._notebook.add(self._tab_method,    text=" 2. Method ")
+        self._notebook.add(self._tab_workspace, text=" 3. Workspace ")
 
         # Bind panel event from variogram panel buttons
         self.bind_all("<<AutoOptimize>>", self._on_auto_optimize_requested)
@@ -383,7 +382,57 @@ class App(tk.Tk):
             label.config(text="▾ Optimization settings")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Tab 3 — Model (switches Kriging ↔ GP panel)
+    # Tab 3 — Workspace (controls + live results)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_tab_workspace(self) -> ttk.Frame:
+        tab = ttk.Frame(self._notebook, padding=8)
+
+        # Compact run-control strip (Run/Cancel/progress/elapsed) — these widget
+        # names are what _on_run / _poll_run / _on_run_complete expect.
+        top = ttk.Frame(tab)
+        top.pack(fill="x")
+        self._run_btn = ttk.Button(top, text="▶  Run full-res",
+                                   command=self._on_run, style="Accent.TButton")
+        self._run_btn.pack(side="left", padx=4)
+        self._cancel_btn = ttk.Button(top, text="■  Cancel",
+                                       command=self._on_cancel, state="disabled")
+        self._cancel_btn.pack(side="left", padx=4)
+        self._progress = ttk.Progressbar(top, mode="indeterminate", length=180)
+        self._progress.pack(side="left", padx=12)
+        self._elapsed_var = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self._elapsed_var, foreground="gray").pack(side="left")
+
+        # The unified workspace panel (controls left, live results right).
+        self._workspace = WorkspacePanel(
+            tab, self.state,
+            on_run_full=self._on_run,
+            on_auto_fit=self._on_auto_optimize_requested)
+        self._workspace.pack(fill="both", expand=True, pady=(6, 0))
+
+        # Collapsible engine log under the results.
+        log_frame = ttk.Frame(tab)
+        log_frame.pack(fill="x", pady=(6, 0))
+        self._log_text = tk.Text(log_frame, height=6, state="disabled",
+                                  font=("Consolas", 9), wrap="word",
+                                  background="#1e1e1e", foreground="#d4d4d4",
+                                  insertbackground="white")
+        vsb = ttk.Scrollbar(log_frame, orient="vertical", command=self._log_text.yview)
+        self._log_text.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._log_text.pack(side="left", fill="both", expand=True)
+
+        # Compatibility shims: run-flow methods reference these; keep harmless stubs.
+        self._summary_var = tk.StringVar(value="")
+        self._open_folder_btn = ttk.Button(top, text="Open Results Folder",
+                                            command=self._open_results_folder,
+                                            state="disabled")
+        # not packed — bundle output is temp; Workspace Export is the path to files
+        self._cv_frame = ttk.Frame(tab)   # unused placeholder (legacy CV table)
+        return tab
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Tab 3 (legacy, unused) — Model (switches Kriging ↔ GP panel)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _build_tab_model(self) -> ttk.Frame:
@@ -399,13 +448,11 @@ class App(tk.Tk):
         return tab
 
     def _switch_model_panel(self):
-        mode = self.state["engine_mode"]
-        if mode == "kriging":
-            self._gp_panel.pack_forget()
-            self._kriging_panel.pack(fill="both", expand=True)
-        else:
-            self._kriging_panel.pack_forget()
-            self._gp_panel.pack(fill="both", expand=True)
+        # Method-tab engine radio → reflect the choice in the Workspace controls.
+        ws = getattr(self, "_workspace", None)
+        if ws is not None:
+            ws._controls.set_engine(self.state["engine_mode"])
+            ws._on_param_change()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Tab 4 — Run & Results
@@ -544,9 +591,9 @@ class App(tk.Tk):
         X, y, n = _load_xyz(fp, cx, cy, cz)
         if X is None:
             return
-        self._kriging_panel.load_data(X, y)
-        self._gp_panel.load_data(X, y)
-        self._log(f"Loaded {n} points. Empirical variogram updated.")
+        self.state["_Xy"] = (X, y)
+        self._workspace.load_data(X, y)
+        self._log(f"Loaded {n} points. Variogram + live preview updated.")
 
     def _on_method_changed(self):
         self.state["engine_mode"] = self._method_var.get()
@@ -617,16 +664,8 @@ class App(tk.Tk):
         if self._opt_runner and self._opt_runner.params:
             params = self._opt_runner.params
             cv     = getattr(self._opt_runner, "cv_summary", None)
-            mode   = self.state.get("engine_mode", "kriging")
-            if mode == "kriging":
-                self._kriging_panel.populate_from_params(params)
-                if cv:
-                    self._kriging_panel.set_cv_results(cv)
-            else:
-                self._gp_panel.populate_from_params(params)
-                if cv:
-                    self._gp_panel.set_cv_results(cv)
-            self._log("── Auto Optimize complete — sliders updated ──")
+            self._workspace.populate_from_params(params, cv)
+            self._log("── Auto Optimize complete — controls updated ──")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Run / Cancel
@@ -683,7 +722,7 @@ class App(tk.Tk):
             return
 
         result = self._runner.result if self._runner else {}
-        self._display_results(result)
+        self._workspace.show_full_result(result or {})
 
     def _on_cancel(self):
         if self._runner:
