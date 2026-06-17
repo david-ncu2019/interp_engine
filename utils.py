@@ -236,7 +236,8 @@ def gaussian_model(h, psill, a, nugget):
 # ========================================================================
 
 def plot_variogram(vario_dict, true_params=None, fitted_params=None,
-                   engine_name="", scenario_name="", save_path=None):
+                   engine_name="", scenario_name="", save_path=None,
+                   fig=None):
     """
     Publication-quality variogram plot with empirical points, pair counts,
     and optional fitted/true model curves.
@@ -246,14 +247,21 @@ def plot_variogram(vario_dict, true_params=None, fitted_params=None,
     vario_dict : dict from compute_empirical_variogram (omnidirectional)
     true_params : dict  {psill, range_major, nugget}   (ground truth)
     fitted_params : dict {psill, range, nugget}         (engine recovered)
+    fig : optional matplotlib Figure to draw onto (UI embedding). When given,
+          the figure is cleared and reused, and it is NOT closed (caller owns
+          it). When None, a new pyplot figure is created and closed as before.
     """
     lags = vario_dict["lags"]
     sv = vario_dict["semivariance"]
     np_ = vario_dict["n_pairs"]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7),
-                                    gridspec_kw={"height_ratios": [3, 1]},
-                                    sharex=True)
+    _own_fig = fig is None
+    if _own_fig:
+        fig = plt.figure(figsize=(10, 7))
+    else:
+        fig.clear()
+    ax1, ax2 = fig.subplots(2, 1, gridspec_kw={"height_ratios": [3, 1]},
+                            sharex=True)
 
     # -- upper: semivariance --
     valid = np_ > 0
@@ -302,11 +310,12 @@ def plot_variogram(vario_dict, true_params=None, fitted_params=None,
     ax2.set_ylabel("# Pairs", fontsize=12)
     ax2.grid(True, ls="--", alpha=0.4)
 
-    plt.tight_layout()
+    fig.tight_layout()
     if save_path:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    if _own_fig:
+        plt.close(fig)
     return fig
 
 
@@ -602,14 +611,21 @@ def perform_kriging_kfold_cv(ak_model, X, y, n_folds=5, seed=42, nst=None):
 # ========================================================================
 
 def plot_cv_dashboard(cv_df, engine_name="", scenario_name="",
-                      save_path=None):
+                      save_path=None, fig=None):
     """
     3-panel cross-validation dashboard:
       A) Observed vs Predicted scatter + 1:1 line + stats
       B) Spatial map of Z-scores
       C) Consistency bar chart (predicted vs observed with error bars)
+
+    fig : optional matplotlib Figure to draw onto (UI embedding); reused and
+          not closed when given. When None, a new pyplot figure is created.
     """
-    fig = plt.figure(figsize=(14, 9), dpi=150)
+    _own_fig = fig is None
+    if _own_fig:
+        fig = plt.figure(figsize=(14, 9), dpi=150)
+    else:
+        fig.clear()
     gs = fig.add_gridspec(2, 2, height_ratios=[1, 1], hspace=0.35, wspace=0.3)
     ax1 = fig.add_subplot(gs[0, 0])
     ax2 = fig.add_subplot(gs[0, 1])
@@ -664,11 +680,12 @@ def plot_cv_dashboard(cv_df, engine_name="", scenario_name="",
 
     fig.suptitle(f"CV Dashboard  -  {scenario_name}  [{engine_name}]",
                  fontsize=14, fontweight="bold")
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
     if save_path:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    if _own_fig:
+        plt.close(fig)
     return fig
 
 
@@ -677,8 +694,12 @@ def plot_cv_dashboard(cv_df, engine_name="", scenario_name="",
 # ========================================================================
 
 def plot_anisotropy_ellipse(params, true_params=None, engine_name="",
-                            scenario_name="", save_path=None):
-    """Draw correlation ellipse comparing recovered vs true anisotropy."""
+                            scenario_name="", save_path=None, fig=None):
+    """Draw correlation ellipse comparing recovered vs true anisotropy.
+
+    fig : optional matplotlib Figure to draw onto (UI embedding); reused and
+          not closed when given. When None, a new pyplot figure is created.
+    """
     angle = params.get("rotation_angle_deg", 0)
     
     # Kriging uses 'range' and 'anisotropy_ratio'
@@ -698,7 +719,12 @@ def plot_anisotropy_ellipse(params, true_params=None, engine_name="",
         ls_major = float(params.get("range", 1.0))
         ls_minor = ls_major / ratio
 
-    fig, ax = plt.subplots(figsize=(7, 7), dpi=150)
+    _own_fig = fig is None
+    if _own_fig:
+        fig = plt.figure(figsize=(7, 7), dpi=150)
+    else:
+        fig.clear()
+    ax = fig.add_subplot(111)
 
     # Recovered ellipse
     # width: diameter along the major axis
@@ -727,10 +753,12 @@ def plot_anisotropy_ellipse(params, true_params=None, engine_name="",
     ax.set_title(f"Anisotropy Ellipse  -  {scenario_name}  [{engine_name}]",
                  fontsize=12, fontweight="bold")
     ax.legend(fontsize=9)
-    plt.tight_layout()
+    fig.tight_layout()
     if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    if _own_fig:
+        plt.close(fig)
     return fig
 
 
@@ -794,7 +822,7 @@ def plot_prediction_surface(X_grid, Y_grid, pred_mean, pred_std,
                             X_obs=None, Y_obs=None,
                             hull_vertices=None,
                             scenario_name="", engine_name="",
-                            save_path=None):
+                            save_path=None, fig=None):
     """
     Side-by-side filled contour plots of predicted mean and uncertainty.
 
@@ -805,8 +833,16 @@ def plot_prediction_surface(X_grid, Y_grid, pred_mean, pred_std,
     pred_std       : 2D array (NaN outside hull)
     X_obs, Y_obs   : optional 1D arrays of observation locations
     hull_vertices  : optional (M, 2) closed polygon
+    fig            : optional matplotlib Figure to draw onto (UI embedding);
+                     reused and not closed when given. When None, a new
+                     pyplot figure is created.
     """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7), dpi=150)
+    _own_fig = fig is None
+    if _own_fig:
+        fig = plt.figure(figsize=(16, 7), dpi=150)
+    else:
+        fig.clear()
+    ax1, ax2 = fig.subplots(1, 2)
 
     # -- Mean surface --
     c1 = ax1.contourf(X_grid, Y_grid, pred_mean, levels=30,
@@ -843,12 +879,13 @@ def plot_prediction_surface(X_grid, Y_grid, pred_mean, pred_std,
     fig.suptitle(
         f"Interpolation Surface  –  {scenario_name}  [{engine_name}]",
         fontsize=14, fontweight="bold")
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
 
     if save_path:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    if _own_fig:
+        plt.close(fig)
     return fig
 
 
