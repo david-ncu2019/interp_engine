@@ -235,16 +235,26 @@ class SubTabCanvas(ttk.Frame):
 
         # Navigation toolbar: home / back / forward / pan / zoom-box / save.
         # pack_toolbar=False lets us place it inside our own frame (left side).
-        self.toolbar = NavigationToolbar2Tk(self.canvas, btn_frame,
-                                             pack_toolbar=False)
-        self.toolbar.update()
-        self.toolbar.pack(side="left")
+        # Wrapped defensively: if the Tk toolbar fails to construct on a given
+        # platform we degrade to "no toolbar" (wheel-zoom still works) rather
+        # than crashing the whole panel.
+        self.toolbar = None
+        try:
+            self.toolbar = NavigationToolbar2Tk(self.canvas, btn_frame,
+                                                 pack_toolbar=False)
+            self.toolbar.update()
+            self.toolbar.pack(side="left")
+        except Exception:
+            self.toolbar = None
 
         ttk.Button(btn_frame, text="Export…", command=self._export).pack(
             side="right", padx=4)
 
         # Mouse-wheel zoom about the cursor (rectilinear axes only).
-        self.canvas.mpl_connect("scroll_event", self._on_scroll)
+        try:
+            self.canvas.mpl_connect("scroll_event", self._on_scroll)
+        except Exception:
+            pass
 
     def _on_scroll(self, event):
         ax = event.inaxes

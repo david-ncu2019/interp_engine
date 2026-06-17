@@ -25,7 +25,7 @@ from ui.variogram_panel import (
     LabeledSlider, SubTabCanvas, VARIOGRAM_MODELS, compute_model_curve,
     compute_empirical_variogram,
 )
-from ui.live_predictor import LivePreviewWorker
+from ui.live_predictor import compute_preview
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,7 +207,6 @@ class WorkspacePanel(ttk.Frame):
         self._y = None
         self._last_full = None         # last full-run result dict (for Export)
         self._debounce_id = None
-        self._live_worker = LivePreviewWorker(marshal=lambda fn: self.after(0, fn))
         self._build()
 
     def _build(self):
@@ -290,23 +289,28 @@ class WorkspacePanel(ttk.Frame):
         self._debounce_id = self.after(300, self._launch_preview)
 
     def _launch_preview(self):
+        # Compute the coarse preview INLINE on the Tk main thread. matplotlib-
+        # TkAgg + Tcl/Tk are not thread-safe; driving a redraw from a worker
+        # thread hard-crashes the process on Windows. The coarse grid keeps a
+        # kriging solve at ~0.2–0.5 s, which is fine after the 300 ms debounce.
         self._debounce_id = None
         if self._X is None:
             return
         self._status_var.set("Computing live preview…")
-        self._live_worker.request(
-            self._controls.engine, self._X, self._y,
-            self._controls.get_preset(), n_cells=40,
-            on_done=self._on_preview_ready, on_error=self._on_preview_error)
-
-    def _on_preview_ready(self, res):
+        try:
+            self.update_idletasks()   # paint the status before the solve
+        except Exception:
+            pass
+        try:
+            res = compute_preview(self._controls.engine, self._X, self._y,
+                                  self._controls.get_preset(), n_cells=40)
+        except Exception as exc:  # noqa: BLE001
+            self._status_var.set(f"Preview failed: {exc}")
+            return
         self._draw_surface(res["X_grid"], res["Y_grid"], res["mean"], res["std"],
                            res["X_obs"], res["Y_obs"], res.get("hull"),
                            title_suffix="(live preview)")
         self._status_var.set("Live preview updated.")
-
-    def _on_preview_error(self, exc):
-        self._status_var.set(f"Preview failed: {exc}")
 
     # ── drawing ──
     def _draw_surface(self, X_grid, Y_grid, mean, std, X_obs, Y_obs, hull,
