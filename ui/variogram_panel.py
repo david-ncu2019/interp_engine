@@ -13,7 +13,7 @@ from typing import Optional, Callable
 import numpy as np
 
 # Matplotlib embedded in Tkinter
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
 from tkinter import filedialog
@@ -221,7 +221,8 @@ class LabeledSlider(ttk.Frame):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SubTabCanvas(ttk.Frame):
-    """One dashboard sub-tab: a matplotlib Figure, its canvas, and an Export button."""
+    """One dashboard sub-tab: an interactive matplotlib Figure (zoom/pan/drag
+    via the navigation toolbar + mouse-wheel zoom) and an Export button."""
 
     def __init__(self, parent, figsize=(6.0, 4.2), dpi=96, **kwargs):
         super().__init__(parent, **kwargs)
@@ -231,8 +232,34 @@ class SubTabCanvas(ttk.Frame):
 
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill="x", pady=(2, 0))
+
+        # Navigation toolbar: home / back / forward / pan / zoom-box / save.
+        # pack_toolbar=False lets us place it inside our own frame (left side).
+        self.toolbar = NavigationToolbar2Tk(self.canvas, btn_frame,
+                                             pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.pack(side="left")
+
         ttk.Button(btn_frame, text="Export…", command=self._export).pack(
             side="right", padx=4)
+
+        # Mouse-wheel zoom about the cursor (rectilinear axes only).
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
+
+    def _on_scroll(self, event):
+        ax = event.inaxes
+        if ax is None or event.xdata is None or event.ydata is None:
+            return
+        # Polar / non-rectilinear axes: leave to the toolbar's own zoom.
+        if getattr(ax, "name", "rectilinear") != "rectilinear":
+            return
+        scale = 1 / 1.2 if event.button == "up" else 1.2  # up = zoom in
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        xd, yd = event.xdata, event.ydata
+        ax.set_xlim(xd - (xd - x0) * scale, xd + (x1 - xd) * scale)
+        ax.set_ylim(yd - (yd - y0) * scale, yd + (y1 - yd) * scale)
+        self.canvas.draw_idle()
 
     def _export(self):
         path = filedialog.asksaveasfilename(
