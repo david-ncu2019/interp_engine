@@ -94,8 +94,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Interpolation Engine")
-        self.geometry("1000x680")
-        self.minsize(860, 580)
+        self.geometry("1280x800")
+        self.minsize(900, 600)
 
         # ── Shared state dict ─────────────────────────────────────────────────
         self.state: dict = {
