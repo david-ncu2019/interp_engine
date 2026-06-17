@@ -362,7 +362,7 @@ class KrigingPanel(ttk.Frame):
 
         self._stats_text = tk.Text(
             frame, height=20, state="disabled", wrap="word",
-            font=("Consolas", 10), background="#f8f8f8", relief="flat")
+            font=("Consolas", 12), background="#f8f8f8", relief="flat")
         vsb = ttk.Scrollbar(frame, orient="vertical",
                             command=self._stats_text.yview)
         self._stats_text.configure(yscrollcommand=vsb.set)
@@ -388,10 +388,10 @@ class KrigingPanel(ttk.Frame):
 
     def _init_plot(self):
         self.ax.clear()
-        self.ax.set_xlabel("Lag distance", fontsize=9)
-        self.ax.set_ylabel("Semivariance", fontsize=9)
-        self.ax.set_title("Variogram", fontsize=10)
-        self.ax.tick_params(labelsize=8)
+        self.ax.set_xlabel("Lag distance", fontsize=11)
+        self.ax.set_ylabel("Semivariance", fontsize=11)
+        self.ax.set_title("Variogram", fontsize=12)
+        self.ax.tick_params(labelsize=10)
         self.canvas.draw_idle()
 
     def load_data(self, X: np.ndarray, y: np.ndarray):
@@ -445,10 +445,10 @@ class KrigingPanel(ttk.Frame):
 
     def _redraw_curve(self):
         self.ax.clear()
-        self.ax.set_xlabel("Lag distance", fontsize=9)
-        self.ax.set_ylabel("Semivariance", fontsize=9)
-        self.ax.set_title("Variogram (live)", fontsize=10)
-        self.ax.tick_params(labelsize=8)
+        self.ax.set_xlabel("Lag distance", fontsize=11)
+        self.ax.set_ylabel("Semivariance", fontsize=11)
+        self.ax.set_title("Variogram (live)", fontsize=12)
+        self.ax.tick_params(labelsize=10)
 
         if self._lags is not None and len(self._lags) > 0:
             self.ax.scatter(self._lags, self._sv, color="#1f77b4",
@@ -464,7 +464,7 @@ class KrigingPanel(ttk.Frame):
                          label=self._model_var.get())
             self.ax.axhline(self._sill_sl.get() + self._nugget_sl.get(),
                             color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
-            self.ax.legend(fontsize=8)
+            self.ax.legend(fontsize=10)
 
         self.canvas.draw_idle()
 
@@ -490,7 +490,7 @@ class KrigingPanel(ttk.Frame):
         fig.clear()
         ax = fig.add_subplot(111)
         if not self._dir_cache:
-            ax.set_title("Directional Variograms (load data first)", fontsize=10)
+            ax.set_title("Directional Variograms (load data first)", fontsize=12)
             self._dir_tab.canvas.draw_idle()
             return
         cmap = plt.cm.tab20
@@ -500,12 +500,12 @@ class KrigingPanel(ttk.Frame):
             ax.plot(dv["lags"][valid], dv["semivariance"][valid], "o-",
                     color=cmap(i / max(n, 1)), ms=4, lw=1.2,
                     label=f"{dv['direction']:.0f}°")
-        ax.set_xlabel("Lag distance", fontsize=9)
-        ax.set_ylabel("Semivariance", fontsize=9)
-        ax.set_title("Directional Variograms (15° intervals)", fontsize=10)
-        ax.tick_params(labelsize=8)
+        ax.set_xlabel("Lag distance", fontsize=11)
+        ax.set_ylabel("Semivariance", fontsize=11)
+        ax.set_title("Directional Variograms (15° intervals)", fontsize=12)
+        ax.tick_params(labelsize=10)
         ax.grid(True, ls=":", alpha=0.4)
-        ax.legend(fontsize=7, ncol=3, loc="upper left")
+        ax.legend(fontsize=9, ncol=3, loc="upper left")
         self._dir_tab.canvas.draw_idle()
 
     def _redraw_anisotropy(self):
@@ -553,9 +553,9 @@ class KrigingPanel(ttk.Frame):
         r_ell = (r_major * r_minor) / np.where(denom == 0, 1e-9, denom)
         ax.plot(theta, r_ell, "r-", lw=2, label="Fitted ellipse")
 
-        ax.set_title("Anisotropy Rose Diagram", fontsize=10, pad=14)
-        ax.tick_params(labelsize=7)
-        ax.legend(fontsize=7, loc="upper right", bbox_to_anchor=(1.28, 1.10))
+        ax.set_title("Anisotropy Rose Diagram", fontsize=12, pad=14)
+        ax.tick_params(labelsize=9)
+        ax.legend(fontsize=9, loc="upper right", bbox_to_anchor=(1.28, 1.10))
         self._aniso_tab.canvas.draw_idle()
 
     def _update_stats(self):
@@ -728,7 +728,7 @@ class GPPanel(ttk.Frame):
             row += 1
 
         ttk.Label(right, text="(nugget & signal variance are\nauto-scaled from data)",
-                  font=("TkDefaultFont", 8), foreground="gray").grid(
+                  font=("TkDefaultFont", 10), foreground="gray").grid(
             row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
         row += 1
 
@@ -747,7 +747,7 @@ class GPPanel(ttk.Frame):
         frame = ttk.Frame(parent)
         self._stats_text = tk.Text(
             frame, height=20, state="disabled", wrap="word",
-            font=("Consolas", 10), background="#f8f8f8", relief="flat")
+            font=("Consolas", 12), background="#f8f8f8", relief="flat")
         vsb = ttk.Scrollbar(frame, orient="vertical",
                             command=self._stats_text.yview)
         self._stats_text.configure(yscrollcommand=vsb.set)
@@ -790,7 +790,7 @@ class GPPanel(ttk.Frame):
         fig.clear()
         ax = fig.add_subplot(111)
         if not self._dir_cache:
-            ax.set_title("Directional Variograms (load data first)", fontsize=10)
+            ax.set_title("Directional Variograms (load data first)", fontsize=12)
             self._dir_tab.canvas.draw_idle()
             return
         cmap = plt.cm.tab20
@@ -800,12 +800,12 @@ class GPPanel(ttk.Frame):
             ax.plot(dv["lags"][valid], dv["semivariance"][valid], "o-",
                     color=cmap(i / max(n, 1)), ms=4, lw=1.2,
                     label=f"{dv['direction']:.0f}°")
-        ax.set_xlabel("Lag distance", fontsize=9)
-        ax.set_ylabel("Semivariance", fontsize=9)
-        ax.set_title("Directional Variograms (15° intervals)", fontsize=10)
-        ax.tick_params(labelsize=8)
+        ax.set_xlabel("Lag distance", fontsize=11)
+        ax.set_ylabel("Semivariance", fontsize=11)
+        ax.set_title("Directional Variograms (15° intervals)", fontsize=12)
+        ax.tick_params(labelsize=10)
         ax.grid(True, ls=":", alpha=0.4)
-        ax.legend(fontsize=7, ncol=3, loc="upper left")
+        ax.legend(fontsize=9, ncol=3, loc="upper left")
         self._dir_tab.canvas.draw_idle()
 
     def _redraw_anisotropy(self):
@@ -842,9 +842,9 @@ class GPPanel(ttk.Frame):
                         + (r_major * np.sin(theta - ang)) ** 2)
         r_ell = (r_major * r_minor) / np.where(denom == 0, 1e-9, denom)
         ax.plot(theta, r_ell, "r-", lw=2, label="Length-scale ellipse")
-        ax.set_title("Anisotropy Rose Diagram", fontsize=10, pad=14)
-        ax.tick_params(labelsize=7)
-        ax.legend(fontsize=7, loc="upper right", bbox_to_anchor=(1.28, 1.10))
+        ax.set_title("Anisotropy Rose Diagram", fontsize=12, pad=14)
+        ax.tick_params(labelsize=9)
+        ax.legend(fontsize=9, loc="upper right", bbox_to_anchor=(1.28, 1.10))
         self._aniso_tab.canvas.draw_idle()
 
     def _update_stats(self):
@@ -873,10 +873,10 @@ class GPPanel(ttk.Frame):
 
     def _init_plot(self):
         self.ax.clear()
-        self.ax.set_xlabel("Lag distance", fontsize=9)
-        self.ax.set_ylabel("Semivariance", fontsize=9)
-        self.ax.set_title("Empirical variogram (reference)", fontsize=10)
-        self.ax.tick_params(labelsize=8)
+        self.ax.set_xlabel("Lag distance", fontsize=11)
+        self.ax.set_ylabel("Semivariance", fontsize=11)
+        self.ax.set_title("Empirical variogram (reference)", fontsize=12)
+        self.ax.tick_params(labelsize=10)
         self.canvas.draw_idle()
 
     def load_data(self, X: np.ndarray, y: np.ndarray):
@@ -899,10 +899,10 @@ class GPPanel(ttk.Frame):
 
     def _redraw_empirical(self):
         self.ax.clear()
-        self.ax.set_xlabel("Lag distance", fontsize=9)
-        self.ax.set_ylabel("Semivariance", fontsize=9)
-        self.ax.set_title("Empirical variogram (reference)", fontsize=10)
-        self.ax.tick_params(labelsize=8)
+        self.ax.set_xlabel("Lag distance", fontsize=11)
+        self.ax.set_ylabel("Semivariance", fontsize=11)
+        self.ax.set_title("Empirical variogram (reference)", fontsize=12)
+        self.ax.tick_params(labelsize=10)
         if self._lags is not None and len(self._lags) > 0:
             self.ax.scatter(self._lags, self._sv, color="#1f77b4", s=30, zorder=3)
             self.ax.axhline(float(np.max(self._sv)), color="gray",
