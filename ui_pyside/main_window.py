@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QRadioButton, QCheckBox, QComboBox, QPushButton, QButtonGroup,
     QFileDialog, QDialog, QDialogButtonBox, QSpinBox, QTabWidget,
-    QProgressBar,
+    QProgressBar, QDockWidget,
 )
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction, QKeySequence
@@ -40,14 +40,18 @@ class GeospatialApp(QMainWindow):
         self._vario_tabs = None        # QTabWidget for variogram tabs
         self._vario_canvases = {}      # {tab_name: MplCanvas}
         self._dir_cache = None         # cached directional variogram results
+        self._refreshing_dock = False  # re-entrancy guard for _on_dock_visibility
 
         splitter = QSplitter(Qt.Horizontal)
         self._sidebar = self._build_sidebar()
         splitter.addWidget(self._sidebar)
-        self._plot_grid = self._build_plot_grid()
-        splitter.addWidget(self._plot_grid)
+        self._plot_area = self._build_plot_grid()
+        splitter.addWidget(self._plot_area)
         splitter.setSizes([320, 1080])
         self.setCentralWidget(splitter)
+
+        # Capture the pristine 2×2 dock arrangement for Reset Layout.
+        self._default_dock_state = self._plot_area.saveState()
 
         self._build_menus()
         self._build_statusbar()
@@ -274,6 +278,20 @@ class GeospatialApp(QMainWindow):
             "surface and uncertainty map at low resolution (live preview).\n"
             "When OFF: click 'Run Interpolation' to see results.")
         vl.addWidget(self._live_cb)
+
+        # Run Options — cross-validation toggle (default OFF = interpolation only)
+        run_opts = QWidget(); rol = QVBoxLayout(run_opts)
+        rol.setContentsMargins(0, 6, 0, 0)
+        rol.addWidget(QLabel("Run Options:"))
+        self._cv_cb = QCheckBox("Compute cross-validation (slower)")
+        self._cv_cb.setChecked(False)
+        self._cv_cb.setToolTip(
+            "Leave-one-out / k-fold CV gives accuracy metrics (MAE/RMSE/R²)\n"
+            "but is O(N³) and slow for large datasets.\n"
+            "Off = interpolation only (no CV dashboard, no metrics).")
+        rol.addWidget(self._cv_cb)
+        vl.addWidget(run_opts)
+
         btn_row = QWidget(); bl = QVBoxLayout(btn_row); bl.setContentsMargins(0, 4, 0, 0)
         self._run_btn = QPushButton("▶  Run Interpolation")
         self._run_btn.setToolTip(
@@ -347,24 +365,68 @@ class GeospatialApp(QMainWindow):
         return sb
 
     # ── plot grid ────────────────────────────────────────────────────
-    def _build_plot_grid(self) -> QWidget:
-        container = QWidget()
-        grid = QGridLayout(container)
-        grid.setContentsMargins(2, 2, 2, 2)
-        grid.setSpacing(4)
+    def _build_plot_grid(self) -> QMainWindow:
+        """Build the right pane as a nested QMainWindow of detachable docks.
+
+        Each of the four panels is wrapped in a QDockWidget (Movable | Floatable,
+        NOT Closable so panels can't be lost). The PlotPanel / MplCanvas objects
+        themselves are stored in self._plots / self._vario_canvases exactly as
+        before, so all redraw code keeps targeting the same live canvases even
+        when a dock is floated onto another monitor.
+
+        Using a nested QMainWindow + addDockWidget/splitDockWidget avoids the
+        QDockWidget-in-QGridLayout pitfall (commit f76295d) that hid content.
+        """
+        area = QMainWindow()
+        area.setObjectName("plotAreaMainWindow")
+        # A zero-size central widget so the docks fill the entire area
+        # (otherwise an empty central widget eats space between the docks).
+        central = QWidget()
+        central.setMaximumSize(0, 0)
+        area.setCentralWidget(central)
+
         self._plots = {}
-        for (row, col, name) in [
-            (0, 0, "Prediction Surface"),
-            (0, 1, "Uncertainty (std)"),
-            (1, 1, "CV Dashboard"),
-        ]:
-            pp = PlotPanel(title=name)
-            self._plots[name] = pp
-            grid.addWidget(pp, row, col)
-        # (1, 0) — variogram tabs (3-tab widget)
+        self._docks = {}
+
+        # Create the three PlotPanels and the variogram tab widget — SAME
+        # objects the redraw code references via self._plots / self._vario_tabs.
+        pred = PlotPanel(title="Prediction Surface")
+        self._plots["Prediction Surface"] = pred
+        uncert = PlotPanel(title="Uncertainty (std)")
+        self._plots["Uncertainty (std)"] = uncert
+        cv = PlotPanel(title="CV Dashboard")
+        self._plots["CV Dashboard"] = cv
         self._vario_tabs = self._build_vario_tabs()
-        grid.addWidget(self._vario_tabs, 1, 0)
-        return container
+
+        def _mk_dock(name: str, widget: QWidget, obj: str) -> QDockWidget:
+            d = QDockWidget(name, area)
+            d.setObjectName(obj)          # REQUIRED for saveState/restoreState
+            d.setWidget(widget)
+            d.setFeatures(QDockWidget.DockWidgetMovable
+                          | QDockWidget.DockWidgetFloatable
+                          | QDockWidget.DockWidgetClosable)
+            self._docks[name] = d
+            return d
+
+        dock_pred   = _mk_dock("Prediction Surface", pred, "dockPrediction")
+        dock_uncert = _mk_dock("Uncertainty (std)", uncert, "dockUncertainty")
+        dock_vario  = _mk_dock("Variogram", self._vario_tabs, "dockVariogram")
+        dock_cv     = _mk_dock("CV Dashboard", cv, "dockCV")
+
+        # 2×2 arrangement:
+        #   [ Prediction | Uncertainty ]
+        #   [ Variogram  |  CV Dashboard ]
+        area.addDockWidget(Qt.TopDockWidgetArea, dock_pred)
+        area.splitDockWidget(dock_pred, dock_uncert, Qt.Horizontal)
+        area.splitDockWidget(dock_pred, dock_vario, Qt.Vertical)
+        area.splitDockWidget(dock_uncert, dock_cv, Qt.Vertical)
+
+        # When a closed dock is re-shown, repaint its canvas from cached state so
+        # it isn't blank/stale. Default-arg capture binds the name per iteration.
+        for _nm, _dk in self._docks.items():
+            _dk.visibilityChanged.connect(
+                lambda visible, nm=_nm: self._on_dock_visibility(nm, visible))
+        return area
 
     def _build_vario_tabs(self) -> QTabWidget:
         from ui_pyside.mpl_canvas import MplCanvas
@@ -374,6 +436,35 @@ class GeospatialApp(QMainWindow):
             self._vario_canvases[tab_name] = canvas
             tabs.addTab(canvas, tab_name)
         return tabs
+
+    def _on_dock_visibility(self, name: str, visible: bool):
+        """When a dock is re-shown, repaint its canvas from cached data so it
+        isn't blank/stale. No-op if data isn't ready or we're mid-refresh."""
+        if not visible or self._refreshing_dock:
+            return
+        if not hasattr(self, "_plots"):      # before widgets exist
+            return
+        self._refreshing_dock = True
+        try:
+            last = self._ctrl._last_full
+            if name in ("Prediction Surface", "Uncertainty (std)"):
+                grid = last.get("grid") if last else None
+                if grid is not None and "mean" in grid:
+                    self._draw_surface(grid)
+            elif name == "CV Dashboard":
+                cv_df = last.get("cv_df") if last else None
+                if cv_df is not None:
+                    self._draw_cv(cv_df)
+                else:
+                    self._show_cv_placeholder()
+            elif name == "Variogram":
+                if self._ctrl._X is not None:
+                    self._draw_variogram_tabs()
+            # No data yet → leave the existing placeholder untouched (no error).
+        except Exception:
+            pass
+        finally:
+            self._refreshing_dock = False
 
     # ── menus ────────────────────────────────────────────────────────
     def _build_menus(self):
@@ -386,6 +477,15 @@ class GeospatialApp(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction("E&xit", self.close, QKeySequence("Ctrl+Q"))
         view_menu = mb.addMenu("&View")
+        panels_menu = view_menu.addMenu("&Panels")
+        # Canonical Qt reopen mechanism: checkable toggle action per dock.
+        # Auto-titled from the dock window title, auto-syncs with the ✕ button.
+        for _name in ("Prediction Surface", "Uncertainty (std)",
+                      "Variogram", "CV Dashboard"):
+            _dock = self._docks.get(_name)
+            if _dock is not None:
+                panels_menu.addAction(_dock.toggleViewAction())
+        view_menu.addSeparator()
         view_menu.addAction("&Reset Layout", self._reset_layout)
         analysis_menu = mb.addMenu("&Analysis")
         analysis_menu.addAction("&Run Full-res", self._ctrl.run_full,
@@ -419,6 +519,8 @@ class GeospatialApp(QMainWindow):
         for sl in self._sliders.values():
             sl.valueChanged.connect(lambda v: self._fire_sliders())
         self._live_cb.toggled.connect(c.set_live)
+        self._cv_cb.toggled.connect(c.set_compute_cv)
+        self._cv_cb.toggled.connect(self._on_cv_toggled)
         self._run_btn.clicked.connect(c.run_full)
         self._auto_btn.clicked.connect(c.auto_fit)
         self._export_btn.clicked.connect(self._export)
@@ -574,6 +676,9 @@ class GeospatialApp(QMainWindow):
         if "n_lags" in updates:
             self._nlags_spin.setValue(updates["n_lags"])
 
+        # Apply compute-CV toggle
+        self._cv_cb.setChecked(bool(updates.get("compute_cv", False)))
+
         # Apply sliders
         s = updates.get("sliders", {})
         for name, val in s.items():
@@ -678,13 +783,42 @@ class GeospatialApp(QMainWindow):
             ax.set_xticks([]); ax.set_yticks([])
             dp.canvas.draw_idle()
 
+    def _on_cv_toggled(self, checked: bool):
+        """When CV is switched OFF, make the off-state obvious (placeholder +
+        metrics hint) instead of leaving stale numbers around."""
+        if not checked:
+            self._show_cv_placeholder()
+            self._metrics_label.setText("CV off — enable to see MAE/RMSE/R²")
+
+    def _show_cv_placeholder(self):
+        dp = self._plots.get("CV Dashboard")
+        if dp is None:
+            return
+        fig = dp.canvas.fig; fig.clear(); ax = fig.add_subplot(111)
+        ax.text(0.5, 0.5,
+                "Cross-validation not computed.\n"
+                "Enable 'Compute cross-validation' and re-run.",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=10, color="gray", wrap=True)
+        ax.set_xticks([]); ax.set_yticks([])
+        dp.canvas.draw_idle()
+
     def _on_result(self, result):
+        if result.get("preview"):
+            # Live preview: only the surface/uncertainty panels update.
+            grid = result.get("grid")
+            if grid is not None and "mean" in grid:
+                self._draw_surface(grid)
+            return
         grid = result.get("grid")
         if grid is not None and "mean" in grid:
             self._draw_surface(grid)
         cv_df = result.get("cv_df")
         if cv_df is not None:
             self._draw_cv(cv_df)
+        else:
+            # Full run with CV off → show the explanation, not a stale dashboard.
+            self._show_cv_placeholder()
 
     def _draw_surface(self, grid):
         # Accept both full-run keys (xv/yv) and live-preview keys (X_grid/Y_grid)
@@ -1110,6 +1244,19 @@ class GeospatialApp(QMainWindow):
 
     def _reset_layout(self):
         self._sidebar.expandSection(0)
+        # Restore the pristine 2×2 dock arrangement (un-float / re-dock panels).
+        try:
+            self._plot_area.restoreState(self._default_dock_state)
+        except Exception:
+            pass
+        # Guarantee every panel is visible again. restoreState of the pristine
+        # snapshot already shows all four (it was captured with all visible), but
+        # make it explicit so a closed panel is always recovered.
+        for _dk in getattr(self, "_docks", {}).values():
+            _dk.show()
+            act = _dk.toggleViewAction()
+            if not act.isChecked():
+                act.setChecked(True)
 
     def _restore_state(self):
         s = QSettings("InterpEngine", "GeospatialApp")
@@ -1118,10 +1265,22 @@ class GeospatialApp(QMainWindow):
             ok = self.restoreGeometry(geo)
             if not ok:
                 self.resize(1400, 900)  # fallback if restored size doesn't fit
+        # Restore dock layout (floating/positions). Guarded so a corrupt or
+        # stale blob from an older version can't crash startup.
+        dock_state = s.value("dock_state")
+        if dock_state:
+            try:
+                self._plot_area.restoreState(dock_state)
+            except Exception:
+                pass
 
     def closeEvent(self, event):
         s = QSettings("InterpEngine", "GeospatialApp")
         s.setValue("geometry", self.saveGeometry())
+        try:
+            s.setValue("dock_state", self._plot_area.saveState())
+        except Exception:
+            pass
         event.accept()
 
 

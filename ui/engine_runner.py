@@ -133,6 +133,7 @@ def build_config(state: dict) -> dict:
             "n_splits":       int(state.get("kriging_n_splits", 3)),
             "n_trials":       int(state.get("kriging_n_trials", 300)),
             "n_lags":         int(state.get("kriging_n_lags", 12)),
+            "compute_cv":     bool(state.get("compute_cv", False)),
         }
         if state.get("kriging_model"):
             k["model"] = state["kriging_model"]
@@ -147,6 +148,7 @@ def build_config(state: dict) -> dict:
             "angle_max":       float(state.get("gp_angle_max", 180.0)),
             "n_optuna_trials": int(state.get("gp_n_trials", 300)),
             "random_state":    state.get("gp_random_state", 42),
+            "compute_cv":      bool(state.get("compute_cv", False)),
         }
         if state.get("gp_preset"):
             g["preset_params"] = state["gp_preset"]

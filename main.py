@@ -430,6 +430,12 @@ def run_pipeline():
     engine_cfg = config.get("engine", {})
     mode = engine_cfg.get("mode", "gp").lower()
 
+    # Master switch for the expensive k-fold cross-validation block below.
+    # CV is O(N^3) per fold and is OFF by default (pure interpolation). Read
+    # from the active engine's sub-config (engine.kriging.compute_cv or
+    # engine.gp.compute_cv) so both engines honour the same toggle.
+    compute_cv = bool(engine_cfg.get(mode, {}).get("compute_cv", False))
+
     if mode == "gp":
         print("[4/7] Initialising RotatedGPR ...")
         gp_cfg = engine_cfg.get("gp", {})
@@ -695,7 +701,10 @@ def run_pipeline():
             print(f"       ✓ H_comparison_{mode}.png")
 
     # I_ Cross-validation dashboard
-    if out_cfg.get("save_diagnostics", True) or ui_mode:
+    # Gated on compute_cv (master switch). CV is the O(N^3) k-fold cost that the
+    # UI "Compute cross-validation" checkbox controls; default OFF = interpolation
+    # only. When off, nothing downstream consumes cv_df/mae/rmse, so skipping is safe.
+    if (out_cfg.get("save_diagnostics", True) or ui_mode) and compute_cv:
         print("       Running cross-validation ...")
         if mode == "gp":
             cv_df = perform_gpr_kfold_cv(model, X, Z_fit, nst=nst)
@@ -797,6 +806,8 @@ def run_pipeline():
                 print(f"       ↑ Gap to ceiling: {gap:.4f} — moderate room for improvement.")
             else:
                 print(f"       ↑ Gap to ceiling: {gap:.4f} — consider data density / model selection.")
+    else:
+        print("       CV skipped (compute_cv=False) — interpolation only, no MAE/RMSE/R².")
 
     # Export — skipped entirely in UI mode (the UI exports on demand).
     if ui_mode:

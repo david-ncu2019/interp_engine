@@ -60,7 +60,10 @@ class WorkspaceController(QObject):
                        "save_diagnostics": True, "export_formats": ["nc"],
                        "detrend_auto": False, "detrend_enabled": False,
                        "detrend_order": 1,
-                       "nst_enabled": False}
+                       "nst_enabled": False,
+                       # Cross-validation is O(N^3) and OFF by default. The CV
+                       # checkbox governs only the full "Run Interpolation" path.
+                       "compute_cv": False}
 
         # Debounce timer for live preview (single-shot, 300ms)
         self._debounce = QTimer(self)
@@ -108,6 +111,10 @@ class WorkspaceController(QObject):
 
     def set_live(self, enabled: bool):
         self._live = enabled
+
+    def set_compute_cv(self, enabled: bool):
+        """Toggle k-fold cross-validation for the full Run path (default OFF)."""
+        self._state["compute_cv"] = bool(enabled)
 
     def set_preprocessing(self, detrend_enabled: bool, detrend_order: int,
                           detrend_auto: bool, nst_enabled):
@@ -207,6 +214,9 @@ class WorkspaceController(QObject):
         state["detrend_enabled"] = False
         state["detrend_auto"] = False
         state["nst_enabled"] = False
+        # Optimization reports params, not CV metrics — force CV off so the
+        # default optimize path stays fast regardless of the CV checkbox.
+        state["compute_cv"] = False
         state["output_dir"] = self._auto_fit_dir
         state["save_diagnostics"] = False
         state["resolution_m"] = 200.0
@@ -417,15 +427,18 @@ class WorkspaceController(QObject):
                        "netcdf_z_dim_name": "Depth",
                        "formats": ["nc"]},
         }
+        compute_cv = bool(self._state.get("compute_cv", False))
         if self._engine == "kriging":
             n_lags = int(self._state.get("kriging_n_lags", 12))
             cfg["engine"]["kriging"] = {
                 "n_lags": n_lags,
                 "preset_params": preset.copy(),
+                "compute_cv": compute_cv,
             }
         else:
             cfg["engine"]["gp"] = {
                 "preset_params": preset.copy(),
+                "compute_cv": compute_cv,
             }
         return cfg
 
@@ -455,6 +468,10 @@ class WorkspaceController(QObject):
 
         # Engine params
         eng = config.get("engine", {})
+        # compute_cv lives under the active engine's sub-config
+        compute_cv = bool(eng.get(engine_mode, {}).get("compute_cv", False))
+        self._state["compute_cv"] = compute_cv
+        updates["compute_cv"] = compute_cv
         if engine_mode == "kriging":
             kc = eng.get("kriging", {})
             preset = kc.get("preset_params", {})
