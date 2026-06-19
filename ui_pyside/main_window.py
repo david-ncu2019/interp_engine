@@ -81,7 +81,10 @@ class GeospatialApp(QMainWindow):
         # Kriging: variogram model dropdown
         self._krig_model_label = QLabel("Variogram Model:")
         self._krig_model_combo = QComboBox()
-        self._krig_model_combo.addItems(list(VARIOGRAM_MODELS.keys()))
+        for m in VARIOGRAM_MODELS:
+            label = (f"{m} (variogram)"
+                     if m.startswith("matern") else m)
+            self._krig_model_combo.addItem(label, m)
         vl.addWidget(self._krig_model_label)
         vl.addWidget(self._krig_model_combo)
         # GP: kernel type dropdown (hidden by default)
@@ -96,6 +99,15 @@ class GeospatialApp(QMainWindow):
         self._gp_kernel_combo.setVisible(False)
         vl.addWidget(self._gp_kernel_label)
         vl.addWidget(self._gp_kernel_combo)
+        # Number of lags (Kriging only)
+        from PySide6.QtWidgets import QSpinBox
+        self._nlags_label = QLabel("Number of lags:")
+        self._nlags_spin = QSpinBox()
+        self._nlags_spin.setRange(4, 50)
+        self._nlags_spin.setValue(12)
+        self._nlags_spin.valueChanged.connect(self._fire_sliders)
+        vl.addWidget(self._nlags_label)
+        vl.addWidget(self._nlags_spin)
         self._sliders = {}
         for name, mn, mx, df in [
             ("Range", 1, 5000, 300), ("Sill (psill)", 0.001, 50, 5.0),
@@ -231,6 +243,8 @@ class GeospatialApp(QMainWindow):
         is_krig = mode == "kriging"
         self._krig_model_label.setVisible(is_krig)
         self._krig_model_combo.setVisible(is_krig)
+        self._nlags_label.setVisible(is_krig)
+        self._nlags_spin.setVisible(is_krig)
         self._gp_kernel_label.setVisible(not is_krig)
         self._gp_kernel_combo.setVisible(not is_krig)
         for name in ("Sill (psill)", "Nugget", "Alpha"):
@@ -247,7 +261,7 @@ class GeospatialApp(QMainWindow):
                        "anisotropy_ratio": self._sliders["Anisotropy ×"].value(),
                        "angle_deg": self._sliders["Angle (°)"].value()}
         else:
-            preset = {"model": self._krig_model_combo.currentText()}
+            preset = {"model": self._krig_model_combo.currentData()}
             for n, sl in self._sliders.items():
                 if n == "Range": preset["range"] = sl.value()
                 elif n == "Sill (psill)": preset["psill"] = sl.value()
@@ -255,6 +269,7 @@ class GeospatialApp(QMainWindow):
                 elif n == "Angle (°)": preset["angle_deg"] = sl.value()
                 elif n == "Anisotropy ×": preset["anisotropy_ratio"] = sl.value()
                 elif n == "Alpha": preset["alpha"] = sl.value()
+        self._ctrl._state["kriging_n_lags"] = self._nlags_spin.value()
         self._ctrl.on_slider_change(preset)
         self._redraw_vario_fit(preset)
 
@@ -313,7 +328,8 @@ class GeospatialApp(QMainWindow):
         fig = dp.canvas.fig; fig.clear(); ax = fig.add_subplot(111)
         ax.set_xlabel("Lag distance"); ax.set_ylabel("Semivariance")
         ax.set_title("Variogram Fit")
-        lags, sv = compute_empirical_variogram(self._ctrl._X, self._ctrl._y)
+        n_lags = self._nlags_spin.value()
+        lags, sv = compute_empirical_variogram(self._ctrl._X, self._ctrl._y, n_lags=n_lags)
         if len(lags):
             ax.scatter(lags, sv, color="#1f77b4", s=28, zorder=3, label="Empirical")
             h = np.linspace(0, lags[-1] * 1.2, 200)
@@ -329,7 +345,10 @@ class GeospatialApp(QMainWindow):
         """Auto-fit completed — populate sliders + redraw variogram fit."""
         import numpy as np
         if "best_model" in params:  # kriging
-            self._krig_model_combo.setCurrentText(params["best_model"])
+            bm = params["best_model"]
+            idx = self._krig_model_combo.findData(bm)
+            if idx >= 0:
+                self._krig_model_combo.setCurrentIndex(idx)
         if "range" in params:
             self._sliders["Range"].setValue(float(params["range"]))
         if "psill" in params:

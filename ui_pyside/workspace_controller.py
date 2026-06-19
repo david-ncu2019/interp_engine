@@ -164,7 +164,9 @@ class WorkspaceController(QObject):
         af_dir = getattr(self, "_auto_fit_dir", None)
         if af_dir:
             self._auto_fit_dir = None
-            params_file = Path(af_dir) / f"parameters_{self._engine}.json"
+            # derive_output_dir creates {base}/{input_stem}/ — read from there
+            in_stem = Path(self._state.get("input_filepath", "data")).stem
+            params_file = Path(af_dir) / in_stem / f"parameters_{self._engine}.json"
             if params_file.exists():
                 import json as _json
                 with open(params_file) as f:
