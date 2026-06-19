@@ -66,7 +66,16 @@ class GeospatialApp(QMainWindow):
         el.addWidget(QLabel("Engine:"))
         self._eng_group = QButtonGroup(self)
         self._radio_krig = QRadioButton("Ordinary Kriging")
+        self._radio_krig.setToolTip(
+            "Classical geostatistical interpolation. Fast, fits a variogram\n"
+            "model to your data, produces a predicted surface + kriging\n"
+            "variance. Good default for most spatial datasets.")
         self._radio_gp = QRadioButton("Gaussian Process")
+        self._radio_gp.setToolTip(
+            "Probabilistic machine learning approach. Fits a covariance\n"
+            "kernel by maximizing the marginal likelihood. Slower but\n"
+            "produces a full predictive distribution with per-point\n"
+            "uncertainty. Better for small to medium datasets.")
         self._radio_krig.setChecked(True)
         self._eng_group.addButton(self._radio_krig, 0)
         self._eng_group.addButton(self._radio_gp, 1)
@@ -81,6 +90,10 @@ class GeospatialApp(QMainWindow):
         # Kriging: variogram model dropdown
         self._krig_model_label = QLabel("Variogram Model:")
         self._krig_model_combo = QComboBox()
+        self._krig_model_combo.setToolTip(
+            "The mathematical model for the variogram curve.\n"
+            "Different models have different shapes near the origin\n"
+            "(linear, S-shaped, asymptotic) — try several to compare.")
         for m in VARIOGRAM_MODELS:
             label = (f"{m} (variogram)"
                      if m.startswith("matern") else m)
@@ -95,6 +108,10 @@ class GeospatialApp(QMainWindow):
             "matern_52 — Matérn-5/2  (moderate, C²)",
             "rbf — RBF  (smooth, C∞)",
         ])
+        self._gp_kernel_combo.setToolTip(
+            "The covariance kernel determines how smooth the predicted\n"
+            "surface is. Matérn-3/2 = rougher (realistic for many natural\n"
+            "phenomena). RBF = infinitely smooth (less common in nature).")
         self._gp_kernel_label.setVisible(False)
         self._gp_kernel_combo.setVisible(False)
         vl.addWidget(self._gp_kernel_label)
@@ -105,10 +122,34 @@ class GeospatialApp(QMainWindow):
         self._nlags_spin = QSpinBox()
         self._nlags_spin.setRange(4, 50)
         self._nlags_spin.setValue(12)
+        self._nlags_spin.setToolTip(
+            "How many distance bins to use when computing the empirical\n"
+            "variogram from your data. More lags = finer detail but\n"
+            "noisier. Fewer lags = smoother but may miss short-range patterns.")
         self._nlags_spin.valueChanged.connect(self._fire_sliders)
         vl.addWidget(self._nlags_label)
         vl.addWidget(self._nlags_spin)
         self._sliders = {}
+        _slider_tooltips = {
+            "Range": "The distance at which the variogram levels off.\n"
+                     "Points farther apart than this range are no longer\n"
+                     "spatially correlated — they're independent.",
+            "Sill (psill)": "The total structured variance — how much the data\n"
+                            "varies due to spatial position alone (excluding\n"
+                            "pure noise from the nugget).",
+            "Nugget": "Variance at zero distance — measurement error +\n"
+                      "variation at scales smaller than your sample spacing.\n"
+                      "A high nugget means noisy data or fine-scale structure.",
+            "Angle (°)": "The direction of maximum spatial continuity.\n"
+                         "0° = East-West, 90° = North-South.\n"
+                         "Only matters when anisotropy is > 1.",
+            "Anisotropy ×": "How much longer the range is in the major direction\n"
+                            "vs. the minor direction. 1.0 = isotropic (same in\n"
+                            "all directions). > 1 = anisotropic.",
+            "Alpha": "Extra shape parameter for stable and rational-quadratic\n"
+                     "models. Controls the curve's steepness near the origin.\n"
+                     "α < 1 = sharper, α > 1 = smoother.",
+        }
         for name, mn, mx, df in [
             ("Range", 1, 5000, 300), ("Sill (psill)", 0.001, 50, 5.0),
             ("Nugget", 0, 20, 0.5), ("Angle (°)", 0, 180, 0),
@@ -116,14 +157,31 @@ class GeospatialApp(QMainWindow):
         ]:
             sl = AnimatedSlider(label=name, min_val=mn, max_val=mx, default=df)
             self._sliders[name] = sl
+            if name in _slider_tooltips:
+                sl.setToolTip(_slider_tooltips[name])
             vl.addWidget(sl)
         self._live_cb = QCheckBox("Live update")
         self._live_cb.setChecked(True)
+        self._live_cb.setToolTip(
+            "When ON: dragging any slider instantly re-renders the prediction\n"
+            "surface and uncertainty map at low resolution (live preview).\n"
+            "When OFF: click 'Run Interpolation' to see results.")
         vl.addWidget(self._live_cb)
         btn_row = QWidget(); bl = QVBoxLayout(btn_row); bl.setContentsMargins(0, 4, 0, 0)
-        self._run_btn = QPushButton("▶  Run full-res")
-        self._auto_btn = QPushButton("⟳  Auto-fit")
+        self._run_btn = QPushButton("▶  Run Interpolation")
+        self._run_btn.setToolTip(
+            "Run the full kriging / GP pipeline with your current slider values.\n"
+            "This computes the prediction surface, cross-validation metrics\n"
+            "(MAE, RMSE, R², mean_SSPE, RMSS), and the CV dashboard.")
+        self._auto_btn = QPushButton("⟳  Optimize Parameters")
+        self._auto_btn.setToolTip(
+            "Automatically find the best variogram / kernel parameters by\n"
+            "optimizing against your data (no sliders needed). After it finishes,\n"
+            "your sliders will update to the optimized values.")
         self._export_btn = QPushButton("\U0001F4BE  Export…")
+        self._export_btn.setToolTip(
+            "Save results to a folder. Nothing is written to disk until you\n"
+            "click this. Choose what to export: figures, grid, CV results.")
         for b in (self._run_btn, self._auto_btn, self._export_btn):
             bl.addWidget(b)
         vl.addWidget(btn_row)
