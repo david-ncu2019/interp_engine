@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QApplication, QSplitter, QStatusBar, QLabel,
     QMenuBar, QMenu, QMessageBox, QWidget, QGridLayout, QVBoxLayout,
     QRadioButton, QCheckBox, QComboBox, QPushButton, QButtonGroup,
-    QFileDialog, QDialog, QDialogButtonBox, QSpinBox,
+    QFileDialog, QDialog, QDialogButtonBox, QSpinBox, QTabWidget,
 )
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction, QKeySequence
@@ -35,6 +35,9 @@ class GeospatialApp(QMainWindow):
         self.setMinimumSize(800, 500)
 
         self._ctrl = WorkspaceController(self)
+        self._vario_tabs = None        # QTabWidget for variogram tabs
+        self._vario_canvases = {}      # {tab_name: MplCanvas}
+        self._dir_cache = None         # cached directional variogram results
 
         splitter = QSplitter(Qt.Horizontal)
         self._sidebar = self._build_sidebar()
@@ -224,13 +227,24 @@ class GeospatialApp(QMainWindow):
         for (row, col, name) in [
             (0, 0, "Prediction Surface"),
             (0, 1, "Uncertainty (std)"),
-            (1, 0, "Variogram Fit"),
             (1, 1, "CV Dashboard"),
         ]:
             pp = PlotPanel(title=name)
             self._plots[name] = pp
             grid.addWidget(pp, row, col)
+        # (1, 0) — variogram tabs (3-tab widget)
+        self._vario_tabs = self._build_vario_tabs()
+        grid.addWidget(self._vario_tabs, 1, 0)
         return container
+
+    def _build_vario_tabs(self) -> QTabWidget:
+        from ui_pyside.mpl_canvas import MplCanvas
+        tabs = QTabWidget()
+        for tab_name in ["Omnidirectional", "Directional 15°", "Anisotropy Rose"]:
+            canvas = MplCanvas(figsize=(5.0, 3.5), dpi=96)
+            self._vario_canvases[tab_name] = canvas
+            tabs.addTab(canvas, tab_name)
+        return tabs
 
     # ── menus ────────────────────────────────────────────────────────
     def _build_menus(self):
@@ -276,6 +290,7 @@ class GeospatialApp(QMainWindow):
         self._export_btn.clicked.connect(self._export)
         c.logLine.connect(self._log.appendLine)
         c.statusMessage.connect(self._status_label.setText)
+        c.dataLoaded.connect(self._compute_directional)
         c.metricsUpdated.connect(self._on_metrics)
         c.paramsReady.connect(self._on_params_ready)
         c.resultReady.connect(self._on_result)
@@ -337,7 +352,11 @@ class GeospatialApp(QMainWindow):
                 elif n == "Alpha": preset["alpha"] = sl.value()
         self._ctrl._state["kriging_n_lags"] = self._nlags_spin.value()
         self._ctrl.on_slider_change(preset)
-        self._redraw_vario_fit(preset)
+        # Redraw all three variogram tabs
+        self._compute_directional()          # recompute dir_cache (n_lags may have changed)
+        self._redraw_omnidirectional(preset)
+        self._redraw_directional()
+        self._redraw_anisotropy_rose(preset)
 
     def _on_result(self, result):
         grid = result.get("grid")
@@ -390,14 +409,30 @@ class GeospatialApp(QMainWindow):
                     va="center", transform=ax.transAxes, fontsize=9)
         dp.canvas.draw_idle()
 
-    def _redraw_vario_fit(self, preset):
+    # ── variogram tabs ─────────────────────────────────────────────────
+    def _compute_directional(self):
+        """Compute 12 directional empirical variograms (15° intervals) and cache."""
+        if self._ctrl._X is None:
+            self._dir_cache = None
+            return
+        from utils import compute_empirical_variogram as utils_variogram
+        directions = list(range(0, 180, 15))  # 0, 15, …, 165
+        n_lags = self._nlags_spin.value()
+        try:
+            self._dir_cache = utils_variogram(
+                self._ctrl._X, self._ctrl._y,
+                n_lags=n_lags, directions=directions)
+        except Exception:
+            self._dir_cache = None
+
+    def _redraw_omnidirectional(self, preset):
         import numpy as np
         from ui.variogram_panel import compute_empirical_variogram, compute_model_curve
-        dp = self._plots.get("Variogram Fit")
-        if dp is None or self._ctrl._X is None:
+        canvas = self._vario_canvases.get("Omnidirectional")
+        if canvas is None or self._ctrl._X is None:
             return
         is_gp = self._ctrl._engine == "gp"
-        fig = dp.canvas.fig; fig.clear(); ax = fig.add_subplot(111)
+        fig = canvas.fig; fig.clear(); ax = fig.add_subplot(111)
         ax.set_xlabel("Lag distance"); ax.set_ylabel("Semivariance")
         ax.set_title("Empirical Variogram" if is_gp else "Variogram Fit")
         n_lags = self._nlags_spin.value()
@@ -418,7 +453,75 @@ class GeospatialApp(QMainWindow):
                 preset.get("nugget", 0.5), preset.get("alpha", 1.0))
             ax.plot(h, gam, color="#d62728", lw=2, label=preset.get("model", "?"))
             ax.legend(fontsize=9)
-        dp.canvas.draw_idle()
+        canvas.draw_idle()
+
+    def _redraw_directional(self):
+        import matplotlib.pyplot as plt
+        canvas = self._vario_canvases.get("Directional 15°")
+        if canvas is None:
+            return
+        fig = canvas.fig; fig.clear(); ax = fig.add_subplot(111)
+        if not self._dir_cache:
+            ax.set_title("Directional Variograms (load data first)", fontsize=10)
+            canvas.draw_idle()
+            return
+        cmap = plt.cm.tab20
+        n = len(self._dir_cache)
+        for i, dv in enumerate(self._dir_cache):
+            valid = dv["n_pairs"] > 0
+            ax.plot(dv["lags"][valid], dv["semivariance"][valid], "o-",
+                    color=cmap(i / max(n, 1)), ms=4, lw=1.2,
+                    label=f"{dv['direction']:.0f}°")
+        ax.set_xlabel("Lag distance", fontsize=9)
+        ax.set_ylabel("Semivariance", fontsize=9)
+        ax.set_title("Directional Variograms (15° intervals)", fontsize=10)
+        ax.tick_params(labelsize=8)
+        ax.grid(True, ls=":", alpha=0.4)
+        ax.legend(fontsize=7, ncol=3, loc="upper left")
+        canvas.draw_idle()
+
+    def _redraw_anisotropy_rose(self, preset):
+        import numpy as np
+        canvas = self._vario_canvases.get("Anisotropy Rose")
+        if canvas is None:
+            return
+        fig = canvas.fig; fig.clear(); ax = fig.add_subplot(111, projection="polar")
+        # Empirical range per direction from cached directional variograms
+        if self._dir_cache:
+            angles_deg, ranges = [], []
+            for dv in self._dir_cache:
+                valid = dv["n_pairs"] > 0
+                lags_v = dv["lags"][valid]; sv_v = dv["semivariance"][valid]
+                if len(lags_v) < 3:
+                    continue
+                target = 0.95 * float(np.max(sv_v))
+                above = np.where(sv_v >= target)[0]
+                est = float(lags_v[above[0]]) if len(above) else float(lags_v[-1])
+                angles_deg.append(dv["direction"]); ranges.append(est)
+            if angles_deg:
+                a = np.array(angles_deg, float); r = np.array(ranges, float)
+                a_full = np.deg2rad(np.concatenate([a, a + 180.0]))
+                r_full = np.concatenate([r, r])
+                order = np.argsort(a_full)
+                a_full, r_full = a_full[order], r_full[order]
+                a_full = np.append(a_full, a_full[0]); r_full = np.append(r_full, r_full[0])
+                ax.plot(a_full, r_full, "o-", color="steelblue", ms=4, lw=1.5,
+                        label="Empirical range")
+                ax.fill(a_full, r_full, color="steelblue", alpha=0.15)
+        # Fitted ellipse from current slider values
+        r_major = max(self._sliders["Range"].value(), 1e-6)
+        ratio = max(self._sliders["Anisotropy ×"].value(), 1.0)
+        r_minor = r_major / ratio
+        ang = np.deg2rad(self._sliders["Angle (°)"].value())
+        theta = np.linspace(0, 2 * np.pi, 240)
+        denom = np.sqrt((r_minor * np.cos(theta - ang)) ** 2
+                        + (r_major * np.sin(theta - ang)) ** 2)
+        r_ell = (r_major * r_minor) / np.where(denom == 0, 1e-9, denom)
+        ax.plot(theta, r_ell, "r-", lw=2, label="Fitted ellipse")
+        ax.set_title("Anisotropy Rose Diagram", fontsize=10, pad=14)
+        ax.tick_params(labelsize=7)
+        ax.legend(fontsize=7, loc="upper right", bbox_to_anchor=(1.28, 1.10))
+        canvas.draw_idle()
 
     def _on_params_ready(self, params: dict):
         """Auto-fit completed — populate sliders + redraw variogram fit."""
@@ -486,6 +589,11 @@ class GeospatialApp(QMainWindow):
             for name in self._plots:
                 p = Path(folder) / f"{name.replace(' ', '_').lower()}.png"
                 self._plots[name].canvas.fig.savefig(p, dpi=150, bbox_inches="tight")
+                saved.append(p.name)
+            # Also export variogram tab figures
+            for tab_name, canvas in self._vario_canvases.items():
+                p = Path(folder) / f"vario_{tab_name.replace(' ', '_').lower()}.png"
+                canvas.fig.savefig(p, dpi=150, bbox_inches="tight")
                 saved.append(p.name)
         ctrl_saved = self._ctrl.export(folder, grid_cb.isChecked(), cv_cb.isChecked())
         if ctrl_saved:

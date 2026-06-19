@@ -28,6 +28,7 @@ import yaml
 # ── Root of the project (parent of ui/) ───────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MAIN_PY      = PROJECT_ROOT / "main.py"
+_TEMP_ROOT   = PROJECT_ROOT / ".temp"
 
 # Matches the fast optimizer's single CV line, e.g.
 #   [fast-opt] CV done in 2.13s: RMSE=0.4521, mean_SSPE=0.987
@@ -157,7 +158,7 @@ def build_config(state: dict) -> dict:
 def write_temp_config(state: dict) -> str:
     """Write config to a temp YAML file; return the file path."""
     cfg = build_config(state)
-    fd, path = tempfile.mkstemp(suffix=".yaml", prefix="interp_ui_")
+    fd, path = tempfile.mkstemp(suffix=".yaml", prefix="ui_", dir=str(_TEMP_ROOT))
     with os.fdopen(fd, "w") as f:
         yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
     return path
@@ -204,7 +205,7 @@ class EngineRunner:
     def _run(self):
         # Full UI runs go to a private temp bundle (no files in the user's
         # output folder); the Workspace reads grid.npz/cv/params back from it.
-        self.bundle_dir = tempfile.mkdtemp(prefix="interp_uirun_")
+        self.bundle_dir = tempfile.mkdtemp(prefix="uirun_", dir=str(_TEMP_ROOT))
         self.state = {**self.state, "ui_mode": True, "bundle_dir": self.bundle_dir}
         config_path = write_temp_config(self.state)
         if VERBOSE:
@@ -381,7 +382,7 @@ class AutoOptimizeRunner:
         opt_state.pop("gp_preset", None)
 
         # Isolated output dir → no pollution of the user's real output folder
-        _tmp_out = tempfile.mkdtemp(prefix="interp_autoopt_")
+        _tmp_out = tempfile.mkdtemp(prefix="autoopt_", dir=str(_TEMP_ROOT))
         opt_state["output_dir"] = _tmp_out
 
         config_path = write_temp_config(opt_state)

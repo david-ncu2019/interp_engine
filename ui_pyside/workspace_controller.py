@@ -1,13 +1,15 @@
 """WorkspaceController — pure signal/slot mediator, no widgets."""
-import os, sys, json, tempfile, csv
+import os, sys, json, tempfile, csv, shutil
 from pathlib import Path
 import numpy as np
 
-from PySide6.QtCore import QObject, QProcess, QTimer, Signal
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+_TEMP_ROOT = PROJECT_ROOT / ".temp"
 
 from ui.engine_runner import build_config
 
@@ -22,6 +24,19 @@ class WorkspaceController(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Clean up stale temp dirs from previous sessions
+        if _TEMP_ROOT.exists():
+            for _d in list(_TEMP_ROOT.iterdir()):
+                try:
+                    if _d.is_dir():
+                        shutil.rmtree(_d, ignore_errors=True)
+                    else:
+                        _d.unlink()
+                except OSError:
+                    pass
+        else:
+            _TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+
         self._X = None
         self._y = None
         self._engine = "kriging"
@@ -110,7 +125,7 @@ class WorkspaceController(QObject):
             return
         self._proc.kill()
         self._proc.waitForFinished(500)
-        self._bundle_dir = tempfile.mkdtemp(prefix="interp_uirun_")
+        self._bundle_dir = tempfile.mkdtemp(prefix="uirun_", dir=str(_TEMP_ROOT))
         state = dict(self._state)
         state["ui_mode"] = True
         state["bundle_dir"] = self._bundle_dir
@@ -124,6 +139,11 @@ class WorkspaceController(QObject):
             state["gp"]["preset_params"] = preset
         cfg_path = _write_temp_config(state)
         self.statusMessage.emit("Running full-resolution interpolation…")
+        # Apply DLL-safe subprocess environment
+        env = QProcessEnvironment()
+        for k, v in self._proc_env.items():
+            env.insert(k, v)
+        self._proc.setProcessEnvironment(env)
         self._proc.start(sys.executable, [str(PROJECT_ROOT / "main.py"), cfg_path])
         self._last_cfg_path = cfg_path
 
@@ -132,7 +152,7 @@ class WorkspaceController(QObject):
             return
         self._proc.kill()
         self._proc.waitForFinished(500)
-        self._auto_fit_dir = tempfile.mkdtemp(prefix="interp_autoopt_")
+        self._auto_fit_dir = tempfile.mkdtemp(prefix="autoopt_", dir=str(_TEMP_ROOT))
         state = dict(self._state)
         state["output_dir"] = self._auto_fit_dir
         state["save_diagnostics"] = False
@@ -146,6 +166,11 @@ class WorkspaceController(QObject):
         state["engine_mode"] = self._engine
         cfg_path = _write_temp_config(state)
         self.statusMessage.emit("Auto-fitting parameters…")
+        # Apply DLL-safe subprocess environment
+        env = QProcessEnvironment()
+        for k, v in self._proc_env.items():
+            env.insert(k, v)
+        self._proc.setProcessEnvironment(env)
         self._proc.start(sys.executable, [str(PROJECT_ROOT / "main.py"), cfg_path])
         self._last_cfg_path = cfg_path
 
@@ -160,15 +185,13 @@ class WorkspaceController(QObject):
             os.unlink(getattr(self, "_last_cfg_path", ""))
         except OSError:
             pass
-        if exit_code != 0:
-            self.statusMessage.emit(f"Engine exited with code {exit_code}")
-            self._auto_fit_dir = None
-            return
-        # ── Auto-fit: read optimized parameters from the temp output dir ──
+
+        # ── Auto-fit: params are saved BEFORE fragile downstream steps ──
+        # (prediction / NetCDF export may fail after params are on disk).
+        # Read them regardless of exit code.
         af_dir = getattr(self, "_auto_fit_dir", None)
-        if af_dir:
+        if af_dir is not None:
             self._auto_fit_dir = None
-            # derive_output_dir creates {base}/{input_stem}/ — read from there
             in_stem = Path(self._state.get("input_filepath", "data")).stem
             params_file = Path(af_dir) / in_stem / f"parameters_{self._engine}.json"
             if params_file.exists():
@@ -178,9 +201,16 @@ class WorkspaceController(QObject):
                 self.paramsReady.emit(params)
                 self.statusMessage.emit("Auto-fit complete — controls updated.")
             else:
-                self.statusMessage.emit("Auto-fit finished — no parameters found.")
+                self.statusMessage.emit(
+                    f"Auto-fit failed (exit {exit_code}) — no parameters found.")
+            # Clean up the temp output dir
+            shutil.rmtree(af_dir, ignore_errors=True)
             return
-        # ── Full run: load the bundle ──
+
+        # ── Full run: require success ──
+        if exit_code != 0:
+            self.statusMessage.emit(f"Engine exited with code {exit_code}")
+            return
         bd = getattr(self, "_bundle_dir", None)
         if not bd:
             return
@@ -225,7 +255,7 @@ class WorkspaceController(QObject):
 def _write_temp_config(state: dict) -> str:
     import yaml
     cfg = build_config(state)
-    fd, path = tempfile.mkstemp(suffix=".yaml", prefix="interp_ui_")
+    fd, path = tempfile.mkstemp(suffix=".yaml", prefix="ui_", dir=str(_TEMP_ROOT))
     with os.fdopen(fd, "w") as f:
         yaml.dump(cfg, f)
     return path
