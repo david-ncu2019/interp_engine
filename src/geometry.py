@@ -2,7 +2,7 @@
 geometry.py - Handles convex hull computation and grid generation
 """
 import numpy as np
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, QhullError
 from matplotlib.path import Path
 
 
@@ -46,10 +46,19 @@ def generate_prediction_grid(X: np.ndarray, Y: np.ndarray, config: dict):
     X_grid, Y_grid = np.meshgrid(x_vec, y_vec)
     grid_shape = X_grid.shape
 
-    # 4. Convex Hull
+    # 4. Convex Hull (hardened against Qhull precision errors on
+    #    collinear / nearly-collinear input points).
     points = np.column_stack((X, Y))
-    hull = ConvexHull(points)
-    hull_verts = points[hull.vertices]
+    try:
+        hull = ConvexHull(points, qhull_options="QJ")
+        hull_verts = points[hull.vertices]
+    except QhullError:
+        # Points are degenerate (collinear / coincident) — fall back to
+        # a rectangular bounding box so the caller still gets a valid grid.
+        hull_verts = np.array([
+            [x_min, y_min], [x_max, y_min],
+            [x_max, y_max], [x_min, y_max],
+        ])
 
     # Expand hull outward from centroid by buffer_pct
     centroid = np.mean(hull_verts, axis=0)

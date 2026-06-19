@@ -100,7 +100,8 @@ class WorkspaceController(QObject):
             self.resultReady.emit({"preview": True, "grid": res})
             self.statusMessage.emit("Live preview updated.")
         except Exception as exc:
-            self.statusMessage.emit(f"Preview failed: {exc}")
+            msg = str(exc).split("\n")[0]  # first line only (Qhull diagnostics are noisy)
+            self.statusMessage.emit(f"Preview failed: {msg}")
 
     # ------------------------------------------------------------------
     # Full run (subprocess via QProcess)
