@@ -46,6 +46,7 @@ class WorkspaceController(QObject):
         self._live = True
         self._last_full = None
         self._auto_fit_dir = None        # temp dir for auto-fit (read params after)
+        self._gt_result = None           # cached ground truth comparison result
         self._on_slider_preset = {
             "model": "spherical", "psill": 5.0, "range": 300,
             "nugget": 0.5, "angle_deg": 0.0, "anisotropy_ratio": 1.0}
@@ -115,6 +116,21 @@ class WorkspaceController(QObject):
         self._state["detrend_order"] = detrend_order
         self._state["detrend_auto"] = detrend_auto
         self._state["nst_enabled"] = nst_enabled  # True/False/None
+
+    def set_grid_mode(self, use_custom: bool):
+        """Toggle between auto-grid (False) and custom prediction points (True)."""
+        self._state["_grid_mode_custom"] = use_custom
+        if not use_custom:
+            # Clear custom points when switching back to auto-grid
+            self._state.pop("prediction_points_filepath", None)
+            self._state.pop("prediction_points_col_x", None)
+            self._state.pop("prediction_points_col_y", None)
+
+    def set_prediction_points_file(self, filepath: str, col_x: str, col_y: str):
+        """Set the custom prediction points CSV and its X/Y columns."""
+        self._state["prediction_points_filepath"] = filepath
+        self._state["prediction_points_col_x"] = col_x
+        self._state["prediction_points_col_y"] = col_y
 
     def on_slider_change(self, preset: dict):
         self._on_slider_preset = preset
@@ -303,6 +319,187 @@ class WorkspaceController(QObject):
             self._last_full["cv_df"].to_csv(Path(folder) / "cv_results.csv", index=False)
             saved.append("cv_results.csv")
         return saved
+
+
+    # ------------------------------------------------------------------
+    # Ground truth comparison (in-process, no subprocess)
+    def compare_ground_truth(self, gt_filepath: str, gt_col: str) -> dict:
+        """Fit model with current slider params, predict at GT points,
+        compute validation metrics. Returns dict for GroundTruthWindow."""
+        import pandas as pd
+        gt_df = pd.read_csv(gt_filepath)
+        # Use same X/Y column names as the training data
+        col_x = self._state.get("col_x", "X")
+        col_y = self._state.get("col_y", "Y")
+        gt_X = gt_df[col_x].to_numpy(dtype=float)
+        gt_Y = gt_df[col_y].to_numpy(dtype=float)
+        gt_obs = gt_df[gt_col].to_numpy(dtype=float)
+
+        preset = self._on_slider_preset
+        if self._engine == "kriging":
+            from src.engines.kriging import AnisotropicKriging
+            from ui.live_predictor import _kriging_params_from_preset
+            model_name = preset.get("model", "spherical")
+            model = AnisotropicKriging()
+            # _kriging_params_from_preset maps angle_deg→angle and
+            # anisotropy_ratio→scaling — the keys _get_ok_instance requires
+            # (it indexes params['angle']/['scaling'] directly, no defaults).
+            model.fit_with_known_params(
+                self._X, self._y, model_name,
+                _kriging_params_from_preset(preset))
+        else:
+            from src.engines.gp import RotatedGPR
+            model = RotatedGPR()
+            model.fit_with_known_params(self._X, self._y, preset)
+
+        # predict() takes a single (N, 2) array of points + return_std.
+        gt_pts = np.column_stack([gt_X, gt_Y])
+        gt_pred, gt_std = model.predict(gt_pts, return_std=True)
+        residuals = gt_pred - gt_obs
+
+        n = len(gt_obs)
+        mae = float(np.mean(np.abs(residuals)))
+        rmse = float(np.sqrt(np.mean(residuals ** 2)))
+        bias = float(np.mean(residuals))
+        ss_res = float(np.sum(residuals ** 2))
+        ss_tot = float(np.sum((gt_obs - gt_obs.mean()) ** 2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+        # SSPE/RMSS (standardized squared prediction error)
+        z_scores = residuals / np.maximum(gt_std, 1e-10)
+        mean_sspe = float(np.mean(z_scores ** 2)) if len(z_scores) else float("nan")
+        rmss = float(np.sqrt(mean_sspe))
+
+        metrics = {
+            "mae": mae, "rmse": rmse, "r2": r2, "bias": bias,
+            "mean_sspe": mean_sspe, "rmss": rmss, "n": n,
+        }
+        self._gt_result = {
+            "metrics": metrics, "residuals": residuals,
+            "gt_obs": gt_obs, "gt_pred": gt_pred,
+            "gt_X": gt_X, "gt_Y": gt_Y, "gt_col": gt_col,
+        }
+        return self._gt_result
+
+    # ------------------------------------------------------------------
+    # Save / Load config
+    def build_config_from_current_state(self) -> dict:
+        """Build a full config YAML dict from the current UI state.
+        Compatible with main.py CLI and Save/Load Config."""
+        import yaml as _yaml
+        preset = self._on_slider_preset
+        cfg = {
+            "input": {
+                "filepath": self._state.get("input_filepath", ""),
+                "columns": {
+                    "x": self._state.get("col_x", "X"),
+                    "y": self._state.get("col_y", "Y"),
+                    "value": self._state.get("col_value", "Value"),
+                },
+            },
+            "geometry": {
+                "resolution_m": float(self._state.get("resolution_m", 50.0)),
+                "convex_hull_buffer_percent": float(
+                    self._state.get("convex_hull_buffer", 10.0)),
+            },
+            "preprocessing": {
+                "detrend": {
+                    "auto_detect": self._state.get("detrend_auto", False),
+                    "enabled": self._state.get("detrend_enabled", False),
+                    "order": int(self._state.get("detrend_order", 1)),
+                },
+                "nst": {
+                    "enabled": self._state.get("nst_enabled", False),
+                },
+            },
+            "engine": {"mode": self._engine},
+            "output": {"save_diagnostics": True,
+                       "netcdf_z_dim_name": "Depth",
+                       "formats": ["nc"]},
+        }
+        if self._engine == "kriging":
+            n_lags = int(self._state.get("kriging_n_lags", 12))
+            cfg["engine"]["kriging"] = {
+                "n_lags": n_lags,
+                "preset_params": preset.copy(),
+            }
+        else:
+            cfg["engine"]["gp"] = {
+                "preset_params": preset.copy(),
+            }
+        return cfg
+
+    def apply_config(self, config: dict):
+        """Apply a loaded config YAML dict to the controller state and
+        return UI update instructions for main_window."""
+        engine_mode = config.get("engine", {}).get("mode", "kriging")
+        self._engine = engine_mode
+        self._state["engine_mode"] = engine_mode
+
+        updates = {"engine_mode": engine_mode}
+
+        # Preprocessing
+        pp = config.get("preprocessing", {})
+        detrend = pp.get("detrend", {})
+        nst = pp.get("nst", {})
+        updates["detrend_enabled"] = detrend.get("enabled", False)
+        updates["detrend_order"] = detrend.get("order", 1)
+        updates["detrend_auto"] = detrend.get("auto_detect", False)
+        nst_val = nst.get("enabled", False)
+        updates["nst_enabled"] = nst_val
+
+        self._state["detrend_enabled"] = updates["detrend_enabled"]
+        self._state["detrend_order"] = updates["detrend_order"]
+        self._state["detrend_auto"] = updates["detrend_auto"]
+        self._state["nst_enabled"] = nst_val
+
+        # Engine params
+        eng = config.get("engine", {})
+        if engine_mode == "kriging":
+            kc = eng.get("kriging", {})
+            preset = kc.get("preset_params", {})
+            updates["kriging_model"] = preset.get("model", "spherical")
+            updates["n_lags"] = kc.get("n_lags", 12)
+            updates["sliders"] = {
+                "Range": preset.get("range", 300.0),
+                "Sill (psill)": preset.get("psill", 5.0),
+                "Nugget": preset.get("nugget", 0.5),
+                "Angle (°)": preset.get("angle_deg", 0.0),
+                "Anisotropy ×": preset.get("anisotropy_ratio", 1.0),
+                "Alpha": preset.get("alpha", 1.0),
+            }
+        else:
+            gc = eng.get("gp", {})
+            preset = gc.get("preset_params", {})
+            updates["gp_kernel"] = preset.get("kernel_type", "matern_52")
+            updates["sliders"] = {
+                "Range": preset.get("length_scale_major", 300.0),
+                "Angle (°)": preset.get("angle_deg", 0.0),
+                "Anisotropy ×": preset.get("anisotropy_ratio", 1.0),
+            }
+
+        # Update the controller's slider preset
+        if engine_mode == "kriging" and "sliders" in updates:
+            s = updates["sliders"]
+            self._on_slider_preset = {
+                "model": updates.get("kriging_model", "spherical"),
+                "psill": s.get("Sill (psill)", 5.0),
+                "range": s.get("Range", 300.0),
+                "nugget": s.get("Nugget", 0.5),
+                "angle_deg": s.get("Angle (°)", 0.0),
+                "anisotropy_ratio": s.get("Anisotropy ×", 1.0),
+                "alpha": s.get("Alpha", 1.0),
+            }
+        elif engine_mode == "gp" and "sliders" in updates:
+            s = updates["sliders"]
+            self._on_slider_preset = {
+                "kernel_type": updates.get("gp_kernel", "matern_52"),
+                "length_scale_major": s.get("Range", 300.0),
+                "anisotropy_ratio": s.get("Anisotropy ×", 1.0),
+                "angle_deg": s.get("Angle (°)", 0.0),
+            }
+
+        return updates
 
 
 def _write_temp_config(state: dict) -> str:

@@ -11,6 +11,7 @@ import ui_pyside  # noqa: F401 — DLL safety first
 from PySide6.QtWidgets import (
     QMainWindow, QApplication, QSplitter, QStatusBar, QLabel,
     QMenuBar, QMenu, QMessageBox, QWidget, QGridLayout, QVBoxLayout,
+    QHBoxLayout,
     QRadioButton, QCheckBox, QComboBox, QPushButton, QButtonGroup,
     QFileDialog, QDialog, QDialogButtonBox, QSpinBox, QTabWidget,
     QProgressBar,
@@ -86,6 +87,37 @@ class GeospatialApp(QMainWindow):
         self._eng_group.addButton(self._radio_gp, 1)
         el.addWidget(self._radio_krig); el.addWidget(self._radio_gp)
         dl.addWidget(eng_w)
+
+        # Grid mode toggle
+        grid_mode_w = QWidget(); gml = QVBoxLayout(grid_mode_w)
+        gml.setContentsMargins(0, 6, 0, 0)
+        gml.addWidget(QLabel("Prediction grid:"))
+        self._grid_mode_group = QButtonGroup(self)
+        self._radio_auto_grid = QRadioButton("Auto (convex hull)")
+        self._radio_custom_pts = QRadioButton("Custom points (CSV)")
+        self._radio_auto_grid.setChecked(True)
+        self._radio_auto_grid.setToolTip(
+            "Generate a regular grid bounded by the buffered convex hull\n"
+            "of your data points. Resolution is set in Engine Options.")
+        self._radio_custom_pts.setToolTip(
+            "Predict at specific X,Y locations from a CSV file.\n"
+            "Useful for predicting at monitoring stations or well locations.")
+        self._grid_mode_group.addButton(self._radio_auto_grid, 0)
+        self._grid_mode_group.addButton(self._radio_custom_pts, 1)
+        gml.addWidget(self._radio_auto_grid); gml.addWidget(self._radio_custom_pts)
+
+        # Custom points file picker (hidden until custom mode selected)
+        self._custom_pts_picker = FilePicker()
+        self._custom_pts_picker.setVisible(False)
+        gml.addWidget(self._custom_pts_picker)
+        self._custom_pts_col_x_label = QLabel("X column:"); self._custom_pts_col_x_label.setVisible(False)
+        self._custom_pts_col_x = QComboBox(); self._custom_pts_col_x.setVisible(False)
+        self._custom_pts_col_y_label = QLabel("Y column:"); self._custom_pts_col_y_label.setVisible(False)
+        self._custom_pts_col_y = QComboBox(); self._custom_pts_col_y.setVisible(False)
+        gml.addWidget(self._custom_pts_col_x_label); gml.addWidget(self._custom_pts_col_x)
+        gml.addWidget(self._custom_pts_col_y_label); gml.addWidget(self._custom_pts_col_y)
+        dl.addWidget(grid_mode_w)
+
         sec_data.setContent(dw)
         sec_data.expand()
 
@@ -260,6 +292,20 @@ class GeospatialApp(QMainWindow):
         for b in (self._run_btn, self._auto_btn, self._export_btn):
             bl.addWidget(b)
         vl.addWidget(btn_row)
+
+        # Save / Load config buttons
+        save_load_row = QWidget(); slrl = QHBoxLayout(save_load_row)
+        slrl.setContentsMargins(0, 2, 0, 0)
+        self._save_cfg_btn = QPushButton("💾 Save Config…")
+        self._save_cfg_btn.setToolTip(
+            "Save current model, engine, and slider settings as a YAML config file.\n"
+            "You can reload it later or use it with the CLI: python main.py saved.yaml")
+        self._load_cfg_btn = QPushButton("📂 Load Config…")
+        self._load_cfg_btn.setToolTip(
+            "Load a saved YAML config file. This will restore engine choice,\n"
+            "variogram model, slider values, and preprocessing settings.")
+        slrl.addWidget(self._save_cfg_btn); slrl.addWidget(self._load_cfg_btn)
+        vl.addWidget(save_load_row)
         sec_vario.setContent(vw)
 
         # Section 4: Engine Options (collapsed)
@@ -272,7 +318,28 @@ class GeospatialApp(QMainWindow):
         el2.addWidget(self._gp_trials_cb)
         sec_eng.setContent(ew)
 
-        # Section 5: Log (collapsed)
+        # Section 5: Validation (ground truth)
+        sec_val = sb.addSection("Validation")
+        vw2 = QWidget(); vl2 = QVBoxLayout(vw2); vl2.setContentsMargins(4, 4, 4, 4)
+        vl2.addWidget(QLabel("Ground truth file:"))
+        self._gt_picker = FilePicker()
+        vl2.addWidget(self._gt_picker)
+        vl2.addWidget(QLabel("Value column:"))
+        self._gt_col_cb = QComboBox()
+        self._gt_col_cb.setToolTip(
+            "The column in the ground truth CSV containing the\n"
+            "observed values to compare against predictions.")
+        vl2.addWidget(self._gt_col_cb)
+        self._gt_compare_btn = QPushButton("Compare")
+        self._gt_compare_btn.setToolTip(
+            "Fit the model with current slider parameters, predict at the\n"
+            "ground truth locations, and open a validation window with\n"
+            "scatter plots, error maps, metrics, and residual diagnostics.")
+        self._gt_compare_btn.setEnabled(False)
+        vl2.addWidget(self._gt_compare_btn)
+        sec_val.setContent(vw2)
+
+        # Section 6: Log (collapsed)
         sec_log = sb.addSection("Log")
         self._log = LogConsole()
         sec_log.setContent(self._log)
@@ -359,6 +426,16 @@ class GeospatialApp(QMainWindow):
         self._detrend_order_cb.currentIndexChanged.connect(self._on_preproc_changed)
         self._detrend_auto_cb.toggled.connect(self._on_preproc_changed)
         self._nst_combo.currentIndexChanged.connect(self._on_preproc_changed)
+        self._grid_mode_group.buttonToggled.connect(self._on_grid_mode_changed)
+        self._custom_pts_picker.fileSelected.connect(self._on_custom_pts_file)
+        self._custom_pts_col_x.currentTextChanged.connect(
+            lambda: self._on_custom_pts_cols_changed())
+        self._custom_pts_col_y.currentTextChanged.connect(
+            lambda: self._on_custom_pts_cols_changed())
+        self._save_cfg_btn.clicked.connect(self._save_config)
+        self._load_cfg_btn.clicked.connect(self._load_config)
+        self._gt_picker.fileSelected.connect(self._on_gt_file_selected)
+        self._gt_compare_btn.clicked.connect(self._on_validate)
         c.logLine.connect(self._log.appendLine)
         c.statusMessage.connect(self._status_label.setText)
         c.dataLoaded.connect(self._on_data_loaded)
@@ -414,6 +491,136 @@ class GeospatialApp(QMainWindow):
         nst_enabled = {0: False, 1: True, 2: None}[nst_mode]
         self._ctrl.set_preprocessing(detrend_enabled, detrend_order,
                                      detrend_auto, nst_enabled)
+
+    def _on_grid_mode_changed(self, btn, checked):
+        if not checked:
+            return
+        use_custom = btn is self._radio_custom_pts
+        self._custom_pts_picker.setVisible(use_custom)
+        self._custom_pts_col_x_label.setVisible(use_custom)
+        self._custom_pts_col_x.setVisible(use_custom)
+        self._custom_pts_col_y_label.setVisible(use_custom)
+        self._custom_pts_col_y.setVisible(use_custom)
+        self._ctrl.set_grid_mode(use_custom)
+        if use_custom:
+            self._live_cb.setChecked(False)
+            self._status_label.setText("Custom points mode — live preview disabled.")
+
+    def _on_custom_pts_file(self, path):
+        import csv
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            headers = csv.DictReader(f).fieldnames or []
+        for cb in (self._custom_pts_col_x, self._custom_pts_col_y):
+            cb.clear(); cb.addItems(headers)
+
+    def _on_custom_pts_cols_changed(self):
+        cx = self._custom_pts_col_x.currentText()
+        cy = self._custom_pts_col_y.currentText()
+        fp = self._custom_pts_picker.path()
+        if fp and cx and cy:
+            self._ctrl.set_prediction_points_file(fp, cx, cy)
+
+    def _save_config(self):
+        from pathlib import Path
+        import yaml
+        cfg = self._ctrl.build_config_from_current_state()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Config", str(Path.home() / "interp_config.yaml"),
+            "YAML files (*.yaml *.yml);;All files (*)")
+        if not path:
+            return
+        with open(path, "w") as f:
+            yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+        self._status_label.setText(f"Config saved to {Path(path).name}")
+
+    def _load_config(self):
+        from pathlib import Path
+        import yaml
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Config", str(Path.home()),
+            "YAML files (*.yaml *.yml);;All files (*)")
+        if not path:
+            return
+        with open(path) as f:
+            cfg = yaml.safe_load(f)
+        updates = self._ctrl.apply_config(cfg)
+
+        # Apply engine mode
+        if updates.get("engine_mode") == "gp":
+            self._radio_gp.setChecked(True)
+        else:
+            self._radio_krig.setChecked(True)
+
+        # Apply preprocessing controls
+        self._detrend_cb.setChecked(updates.get("detrend_enabled", False))
+        order_idx = max(0, min(2, updates.get("detrend_order", 1) - 1))
+        self._detrend_order_cb.setCurrentIndex(order_idx)
+        self._detrend_auto_cb.setChecked(updates.get("detrend_auto", False))
+        nst_map = {False: 0, True: 1, None: 2}
+        self._nst_combo.setCurrentIndex(nst_map.get(updates.get("nst_enabled"), 0))
+
+        # Apply model/kernel
+        if updates.get("kriging_model"):
+            idx = self._krig_model_combo.findData(updates["kriging_model"])
+            if idx >= 0:
+                self._krig_model_combo.setCurrentIndex(idx)
+        if updates.get("gp_kernel"):
+            for i in range(self._gp_kernel_combo.count()):
+                if self._gp_kernel_combo.itemText(i).startswith(updates["gp_kernel"]):
+                    self._gp_kernel_combo.setCurrentIndex(i)
+                    break
+
+        # Apply n_lags
+        if "n_lags" in updates:
+            self._nlags_spin.setValue(updates["n_lags"])
+
+        # Apply sliders
+        s = updates.get("sliders", {})
+        for name, val in s.items():
+            if name in self._sliders:
+                self._sliders[name].setValue(val)
+
+        self._status_label.setText(f"Config loaded from {Path(path).name}")
+        self._fire_sliders()
+
+    def _on_gt_file_selected(self, path):
+        import csv
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            headers = csv.DictReader(f).fieldnames or []
+        self._gt_col_cb.clear(); self._gt_col_cb.addItems(headers)
+        # Auto-select a likely value column
+        for guess in ("Value", "value", "Z", "elev", "elevation", "grade"):
+            if guess in headers:
+                self._gt_col_cb.setCurrentText(guess)
+                break
+        self._gt_compare_btn.setEnabled(len(headers) > 0)
+
+    def _on_validate(self):
+        fp = self._gt_picker.path()
+        col = self._gt_col_cb.currentText()
+        if not fp or not col:
+            return
+        self._status_label.setText("Running ground truth comparison…")
+        # The comparison fits + predicts on the main thread and can be slow for a
+        # large ground-truth grid; show the busy indicator so the UI isn't a silent freeze.
+        self._on_busy_started("Comparing to ground truth…")
+        try:
+            result = self._ctrl.compare_ground_truth(fp, col)
+            from ui_pyside.ground_truth_window import GroundTruthWindow
+            win = GroundTruthWindow(
+                result["metrics"], result["residuals"],
+                result["gt_obs"], result["gt_pred"],
+                result["gt_X"], result["gt_Y"],
+                result["gt_col"], parent=self)
+            win.exec()
+            self._status_label.setText(
+                f"Ground truth: MAE={result['metrics']['mae']:.3f}, "
+                f"RMSE={result['metrics']['rmse']:.3f}, "
+                f"R²={result['metrics']['r2']:.3f}")
+        except Exception as exc:
+            self._status_label.setText(f"Validation failed: {exc}")
+        finally:
+            self._on_busy_finished()
 
     def _current_preset(self) -> dict:
         """Build the preset dict from the current engine + slider/combo state."""
@@ -713,38 +920,184 @@ class GeospatialApp(QMainWindow):
 
     def _export(self):
         dlg = QDialog(self)
-        dlg.setWindowTitle("Export results")
+        dlg.setWindowTitle("Export Results")
+        dlg.setMinimumWidth(360)
         layout = QVBoxLayout(dlg)
-        layout.addWidget(QLabel("Export to folder:"))
-        fig_cb = QCheckBox("Figures (PNG)"); fig_cb.setChecked(True)
-        grid_cb = QCheckBox("Predicted grid (.npz)"); grid_cb.setChecked(True)
-        cv_cb = QCheckBox("CV results (.csv)"); cv_cb.setChecked(True)
-        layout.addWidget(fig_cb); layout.addWidget(grid_cb); layout.addWidget(cv_cb)
+        layout.setSpacing(6)
+
+        # ── Figures section ──
+        figs_label = QLabel("☐ Figures")
+        figs_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(figs_label)
+        fig_cbs = {}
+        fig_names = [
+            ("fig_pred", "Prediction Surface"),
+            ("fig_uncert", "Uncertainty (std)"),
+            ("fig_cv", "CV Dashboard"),
+            ("fig_vario_omni", "Variogram — Omnidirectional"),
+            ("fig_vario_dir", "Variogram — Directional 15°"),
+            ("fig_vario_rose", "Variogram — Anisotropy Rose"),
+        ]
+        for key, label in fig_names:
+            cb = QCheckBox("  " + label); cb.setChecked(True)
+            fig_cbs[key] = cb; layout.addWidget(cb)
+
+        # ── Data section ──
+        data_label = QLabel("☐ Data")
+        data_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(data_label)
+        data_cbs = {}
+        data_items = [
+            ("data_grid", "Predicted grid (.npz)"),
+            ("data_cv", "CV results (.csv)"),
+            ("data_params", "Parameters (.yaml)"),
+        ]
+        for key, label in data_items:
+            cb = QCheckBox("  " + label); cb.setChecked(True)
+            data_cbs[key] = cb; layout.addWidget(cb)
+
+        # ── Validation section (only if GT was run) ──
+        has_gt = self._ctrl._gt_result is not None
+        val_label = QLabel("☐ Validation")
+        val_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(val_label)
+        val_cbs = {}
+        val_items = [
+            ("val_metrics", "Ground truth metrics (.csv)"),
+            ("val_fig", "Comparison figure (.png)"),
+        ]
+        for key, label in val_items:
+            cb = QCheckBox("  " + label)
+            cb.setChecked(has_gt); cb.setEnabled(has_gt)
+            val_cbs[key] = cb; layout.addWidget(cb)
+
+        # ── Select All / None ──
+        sel_row = QWidget(); srl = QHBoxLayout(sel_row); srl.setContentsMargins(0, 4, 0, 0)
+        all_btn = QPushButton("Select All")
+        none_btn = QPushButton("Deselect All")
+        srl.addWidget(all_btn); srl.addWidget(none_btn)
+        layout.addWidget(sel_row)
+
+        def _select_all(checked):
+            for d in (fig_cbs, data_cbs, val_cbs):
+                for cb in d.values():
+                    if cb.isEnabled():
+                        cb.setChecked(checked)
+        all_btn.clicked.connect(lambda: _select_all(True))
+        none_btn.clicked.connect(lambda: _select_all(False))
+
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         layout.addWidget(btns)
+
         if dlg.exec() != QDialog.Accepted:
             return
         folder = QFileDialog.getExistingDirectory(self, "Export to folder")
         if not folder:
             return
         saved = []
-        if fig_cb.isChecked():
-            for name in self._plots:
-                p = Path(folder) / f"{name.replace(' ', '_').lower()}.png"
-                self._plots[name].canvas.fig.savefig(p, dpi=150, bbox_inches="tight")
-                saved.append(p.name)
-            # Also export variogram tab figures
-            for tab_name, canvas in self._vario_canvases.items():
-                p = Path(folder) / f"vario_{tab_name.replace(' ', '_').lower()}.png"
-                canvas.fig.savefig(p, dpi=150, bbox_inches="tight")
-                saved.append(p.name)
-        ctrl_saved = self._ctrl.export(folder, grid_cb.isChecked(), cv_cb.isChecked())
+        # Figures
+        if any(cb.isChecked() for cb in fig_cbs.values()):
+            plot_map = {
+                "fig_pred": "Prediction Surface",
+                "fig_uncert": "Uncertainty (std)",
+            }
+            for key, name in plot_map.items():
+                if fig_cbs.get(key) and fig_cbs[key].isChecked():
+                    pp = self._plots.get(name)
+                    if pp:
+                        p = Path(folder) / f"{name.replace(' ', '_').lower()}.png"
+                        pp.canvas.fig.savefig(p, dpi=150, bbox_inches="tight")
+                        saved.append(p.name)
+            if fig_cbs.get("fig_cv") and fig_cbs["fig_cv"].isChecked():
+                pp = self._plots.get("CV Dashboard")
+                if pp:
+                    p = Path(folder) / "cv_dashboard.png"
+                    pp.canvas.fig.savefig(p, dpi=150, bbox_inches="tight")
+                    saved.append(p.name)
+            vario_map = {
+                "fig_vario_omni": "Omnidirectional",
+                "fig_vario_dir": "Directional 15°",
+                "fig_vario_rose": "Anisotropy Rose",
+            }
+            for key, tab_name in vario_map.items():
+                if fig_cbs.get(key) and fig_cbs[key].isChecked():
+                    canvas = self._vario_canvases.get(tab_name)
+                    if canvas:
+                        p = Path(folder) / f"vario_{tab_name.replace(' ', '_').lower()}.png"
+                        canvas.fig.savefig(p, dpi=150, bbox_inches="tight")
+                        saved.append(p.name)
+
+        # Data
+        want_grid = data_cbs.get("data_grid") and data_cbs["data_grid"].isChecked()
+        want_cv = data_cbs.get("data_cv") and data_cbs["data_cv"].isChecked()
+        want_params = data_cbs.get("data_params") and data_cbs["data_params"].isChecked()
+        ctrl_saved = self._ctrl.export(folder, want_grid, want_cv)
         if ctrl_saved:
             saved.extend(ctrl_saved)
+        if want_params:
+            import yaml
+            cfg = self._ctrl.build_config_from_current_state()
+            p = Path(folder) / "parameters.yaml"
+            with open(p, "w") as f:
+                yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+            saved.append(p.name)
+
+        # Validation
+        if has_gt:
+            if val_cbs.get("val_metrics") and val_cbs["val_metrics"].isChecked():
+                import csv
+                p = Path(folder) / "ground_truth_metrics.csv"
+                m = self._ctrl._gt_result["metrics"]
+                with open(p, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=m.keys())
+                    writer.writeheader(); writer.writerow(m)
+                saved.append(p.name)
+            if val_cbs.get("val_fig") and val_cbs["val_fig"].isChecked():
+                # Regenerate comparison figure from cached GT data
+                import matplotlib.pyplot as plt
+                import numpy as np
+                gt = self._ctrl._gt_result
+                fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+                # Scatter
+                ax = axes[0, 0]
+                ax.scatter(gt["gt_obs"], gt["gt_pred"], alpha=0.6, s=36,
+                           color="#1f77b4", edgecolors="white", linewidth=0.5)
+                lims = [min(gt["gt_obs"].min(), gt["gt_pred"].min()),
+                        max(gt["gt_obs"].max(), gt["gt_pred"].max())]
+                pad = (lims[1] - lims[0]) * 0.05
+                ax.plot([lims[0]-pad, lims[1]+pad], [lims[0]-pad, lims[1]+pad],
+                        "r--", lw=1.5, alpha=0.7)
+                ax.set_xlabel(f"Observed ({gt.get('gt_col', 'Value')})")
+                ax.set_ylabel("Predicted")
+                ax.set_title("Predicted vs Observed")
+                # Error map
+                ax2 = axes[0, 1]
+                res = gt["residuals"]
+                abs_res = np.abs(res)
+                max_abs = max(abs_res.max(), 1e-9)
+                sizes = 20 + 120 * (abs_res / max_abs)
+                colors = np.where(res >= 0, "#d62728", "#1f77b4")
+                ax2.scatter(gt["gt_X"], gt["gt_Y"], c=colors, s=sizes,
+                            alpha=0.75, edgecolors="white", linewidth=0.4)
+                ax2.set_xlabel("X"); ax2.set_ylabel("Y")
+                ax2.set_title("Spatial Error Map")
+                ax2.set_aspect("equal")
+                # Histogram
+                ax3 = axes[1, 1]
+                ax3.hist(res, bins=max(12, int(len(res)**0.5)), density=True,
+                         color="steelblue", alpha=0.6, edgecolor="white")
+                ax3.axvline(0, color="gray", ls="--", lw=1, alpha=0.5)
+                ax3.set_xlabel("Residual"); ax3.set_title("Residual Distribution")
+                fig.tight_layout()
+                p = Path(folder) / "ground_truth_comparison.png"
+                fig.savefig(p, dpi=150, bbox_inches="tight")
+                plt.close(fig)
+                saved.append(p.name)
+
         QMessageBox.information(self, "Export complete",
-            "Saved:\n" + "\n".join(saved) if saved else "Nothing selected.")
+            "Saved:\n" + "\n".join(sorted(saved)) if saved else "Nothing selected.")
 
     def _about(self):
         QMessageBox.about(self, "About",

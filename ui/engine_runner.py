@@ -53,6 +53,8 @@ def build_config(state: dict) -> dict:
     State keys (set by the UI tabs):
       input_filepath, col_x, col_y, col_value,
       ground_truth_filepath (optional),
+      prediction_points_filepath (optional),
+      prediction_points_col_x, prediction_points_col_y,
       output_dir,
       export_formats (list),
       resolution_m,
@@ -95,6 +97,16 @@ def build_config(state: dict) -> dict:
         "resolution_m":               float(state.get("resolution_m", 50.0)),
         "convex_hull_buffer_percent": float(state.get("convex_hull_buffer", 10.0)),
     }
+
+    # ── Prediction Points (optional — predict at these locations instead of grid) ──
+    if state.get("prediction_points_filepath"):
+        cfg["prediction_points"] = {
+            "filepath": state["prediction_points_filepath"],
+            "columns": {
+                "x": state.get("prediction_points_col_x", "X"),
+                "y": state.get("prediction_points_col_y", "Y"),
+            },
+        }
 
     # ── Preprocessing ──────────────────────────────────────────────────────────
     cfg["preprocessing"] = {
