@@ -44,12 +44,10 @@ The third step downloads everything the app needs — it can take a few minutes 
 
 ## Start the app
 
-```bash
-conda activate interp-engine
-python -m ui_pyside.main_window
-```
+Double-click **`Launch Kriging App.vbs`** in the project folder. The app window opens — no
+terminal window, no extra steps.
 
-(You only need the first line if you've opened a new window since setting up.)
+> **Tip:** right-click it → Send to → Desktop (create shortcut) to put it on your desktop.
 
 ---
 
@@ -57,7 +55,7 @@ python -m ui_pyside.main_window
 
 Two small example files come with the app so you can see it work right away:
 
-1. Start the app using the command above.
+1. Double-click **`Launch Kriging App.vbs`** to open the app.
 2. In the **Data** section on the left, open `test_data/S1_Isotropic.csv`.
 3. Tell it which columns to use: pick `X`, `Y`, and `Value`.
 4. Click **Optimize Parameters** to let the app find good settings automatically.
@@ -84,7 +82,7 @@ Want to see a different pattern? Try `test_data/S2_Anisotropic_45deg.csv` the sa
 
 ## If something goes wrong
 
-- **The app won't start.** Make sure you ran `conda activate interp-engine` first — the app only
-  works inside that environment.
+- **The app won't start.** Make sure you completed the setup step (`conda env create -f
+  environment.yml`) and that you're double-clicking `Launch Kriging App.vbs`, not `kriging.bat`.
 - **It feels slow.** Leave the **accuracy check** turned off, and keep your point count
   reasonable (a few thousand points at most).
