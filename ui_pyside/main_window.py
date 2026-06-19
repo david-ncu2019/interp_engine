@@ -116,6 +116,16 @@ class GeospatialApp(QMainWindow):
         self._gp_kernel_combo.setVisible(False)
         vl.addWidget(self._gp_kernel_label)
         vl.addWidget(self._gp_kernel_combo)
+        # GP notice (visible only for GP)
+        self._gp_notice = QLabel(
+            "GP uses marginal likelihood, not variogram fitting.\n"
+            "The empirical variogram is shown for reference only.")
+        self._gp_notice.setWordWrap(True)
+        self._gp_notice.setStyleSheet(
+            "QLabel { color: palette(placeholder-text); font-style: italic; "
+            "padding: 4px; font-size: 10px; }")
+        self._gp_notice.setVisible(False)
+        vl.addWidget(self._gp_notice)
         # Number of lags (Kriging only)
         from PySide6.QtWidgets import QSpinBox
         self._nlags_label = QLabel("Number of lags:")
@@ -305,6 +315,7 @@ class GeospatialApp(QMainWindow):
         self._nlags_spin.setVisible(is_krig)
         self._gp_kernel_label.setVisible(not is_krig)
         self._gp_kernel_combo.setVisible(not is_krig)
+        self._gp_notice.setVisible(not is_krig)
         for name in ("Sill (psill)", "Nugget", "Alpha"):
             if name in self._sliders:
                 self._sliders[name].setVisible(is_krig)
@@ -383,13 +394,21 @@ class GeospatialApp(QMainWindow):
         dp = self._plots.get("Variogram Fit")
         if dp is None or self._ctrl._X is None:
             return
+        is_gp = self._ctrl._engine == "gp"
         fig = dp.canvas.fig; fig.clear(); ax = fig.add_subplot(111)
         ax.set_xlabel("Lag distance"); ax.set_ylabel("Semivariance")
-        ax.set_title("Variogram Fit")
+        ax.set_title("Empirical Variogram" if is_gp else "Variogram Fit")
         n_lags = self._nlags_spin.value()
         lags, sv = compute_empirical_variogram(self._ctrl._X, self._ctrl._y, n_lags=n_lags)
         if len(lags):
             ax.scatter(lags, sv, color="#1f77b4", s=28, zorder=3, label="Empirical")
+        if is_gp:
+            ax.text(0.5, 0.92,
+                    "GP fits by marginal likelihood —\n"
+                    "the kernel is not fitted to the empirical variogram.",
+                    ha="center", va="top", transform=ax.transAxes,
+                    fontsize=9, fontstyle="italic", color="gray")
+        elif len(lags):
             h = np.linspace(0, lags[-1] * 1.2, 200)
             gam = compute_model_curve(
                 preset.get("model", "spherical"), h,
