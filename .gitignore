@@ -10,3 +10,10 @@
 # Also track config and documentation files
 !*.yaml
 !*.md
+
+# Conda environment file (.yml is not covered by the *.yaml rule above)
+!environment.yml
+
+# Ship a couple of small sample datasets for the quick-start
+!test_data/S1_Isotropic.csv
+!test_data/S2_Anisotropic_45deg.csv

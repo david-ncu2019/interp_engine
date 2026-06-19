@@ -1,0 +1,26 @@
+name: interp-engine
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.12
+  # UI
+  - pyside6
+  - matplotlib
+  # numerics / data
+  - numpy
+  - pandas
+  - scipy
+  - xarray
+  - netcdf4
+  - pyyaml
+  # interpolation engines
+  - pykrige
+  - scikit-learn
+  - optuna
+  - joblib
+  # trend / spatial statistics (preprocessing)
+  - statsmodels
+  - libpysal
+  - esda
