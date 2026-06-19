@@ -13,8 +13,14 @@ import sys
 import matplotlib.pyplot as plt
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.cluster import KMeans
-from scipy.optimize import differential_evolution, minimize as sp_minimize
+from scipy.optimize import differential_evolution, minimize as sp_minimize, least_squares
 import optuna
+
+# Cap on the number of points used to ESTIMATE the empirical variogram. The variogram
+# is a statistical estimate; a few thousand points capture its shape, while the full
+# pairwise computation is O(N^2) in time and memory. Above this, deterministically
+# subsample. The final OrdinaryKriging model is always built on ALL points.
+VARIO_MAX_POINTS = 2000
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -273,16 +279,21 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         wls_weight: float = 0.4,
         cv_weight: float = 0.4,
         sspe_weight: float = 0.2,
+        compute_cv: bool = False,
     ) -> 'AnisotropicKriging':
-        """Fast deterministic variogram optimizer — three-stage pipeline.
+        """Fast deterministic variogram optimizer — fit the model to the empirical
+        variogram given a user-chosen number of lags.
 
         Stage 1: Data-driven initial estimates from empirical variogram.
-        Stage 2: WLS-only DE on 3D/4D (psill, range, nugget, [alpha]) — no CV.
+        Stage 2: WLS fit via multi-start least_squares (psill, range, nugget, [alpha]).
         Stage 3: Directional anisotropy from 4 directional variograms.
-        Stage 4: Single 5-fold CV for quality reporting, final model build.
+        Stage 4: Optional CV for quality reporting (off by default), final model build.
 
-        Target: <15 seconds for 500 points (was ~5 minutes).
-        Fully deterministic: same data + same model → same result every time.
+        Performance:
+          - The empirical variogram is estimated from at most VARIO_MAX_POINTS
+            (deterministic subsample) so the O(N^2) cost stays bounded for large N.
+          - Stage-4 CV (the only O(N^3) work) is skipped unless compute_cv=True.
+        Target: <2 seconds. Fully deterministic: same data + model → same result.
         """
         import time as _time
         from utils import compute_empirical_variogram, make_spatial_block_folds
@@ -296,11 +307,23 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         max_dist = float(np.sqrt((X[:, 0].max() - X[:, 0].min())**2 +
                                   (X[:, 1].max() - X[:, 1].min())**2))
 
-        print(f"       [fast-opt] Model: {model_name}, n_lags: {n_lags}, "
-              f"N={len(y)}", flush=True)
+        # Deterministically subsample the points used to ESTIMATE the variogram when
+        # N is large — keeps the O(N^2) empirical-variogram cost (and the directional
+        # variant in Stage 3) bounded. The final model is still built on all points.
+        if len(X) > VARIO_MAX_POINTS:
+            rng = np.random.default_rng(0)
+            sub = rng.choice(len(X), size=VARIO_MAX_POINTS, replace=False)
+            sub.sort()
+            X_emp, y_emp = X[sub], y[sub]
+            print(f"       [fast-opt] Model: {model_name}, n_lags: {n_lags}, N={len(y)} "
+                  f"(variogram from {VARIO_MAX_POINTS}-pt subsample)", flush=True)
+        else:
+            X_emp, y_emp = X, y
+            print(f"       [fast-opt] Model: {model_name}, n_lags: {n_lags}, "
+                  f"N={len(y)}", flush=True)
 
         # ── Stage 1: Empirical variogram + initial estimates ─────────────────
-        emp = compute_empirical_variogram(X, y, n_lags=n_lags)
+        emp = compute_empirical_variogram(X_emp, y_emp, n_lags=n_lags)
         emp_lags = emp['lags']
         emp_sv = emp['semivariance']
         emp_npairs = emp['n_pairs']
@@ -335,49 +358,71 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         if has_alpha:
             bounds_wls.append((0.1, 2.0))          # alpha
 
-        def wls_objective(params_vec):
+        def _gamma(params_vec):
             psill, v_range, nugget = params_vec[0], max(params_vec[1], 1e-6), params_vec[2]
             alpha = params_vec[3] if has_alpha else None
-
             if alpha is not None:
-                gamma_model = evaluator(emp_lags, max(psill, 1e-12), v_range, nugget, alpha)
+                gm = evaluator(emp_lags, max(psill, 1e-12), v_range, nugget, alpha)
             else:
-                gamma_model = evaluator(emp_lags, max(psill, 1e-12), v_range, nugget)
+                gm = evaluator(emp_lags, max(psill, 1e-12), v_range, nugget)
+            return np.maximum(gm, 1e-12)
 
-            gamma_model = np.maximum(gamma_model, 1e-12)
-
+        def wls_residuals(params_vec):
+            """Weighted residual VECTOR for least_squares (Cressie weighting)."""
+            gamma_model = _gamma(params_vec)
             if use_cressie:
                 weights = emp_npairs / (gamma_model ** 2)
             else:
                 weights = emp_npairs
+            return np.sqrt(weights) * (emp_sv - gamma_model)
 
-            return float(np.sum(weights * (emp_sv - gamma_model) ** 2))
+        def wls_objective(params_vec):
+            """Scalar WLS cost = sum of squared weighted residuals."""
+            return float(np.sum(wls_residuals(params_vec) ** 2))
 
-        print("       [fast-opt] Stage 2: WLS-only DE ...", flush=True)
+        print("       [fast-opt] Stage 2: WLS multi-start least_squares ...", flush=True)
         t1 = _time.perf_counter()
 
-        try:
-            result_de = differential_evolution(
-                wls_objective, bounds=bounds_wls,
-                seed=0, tol=1e-6, maxiter=200, polish=False,
-                init='sobol',
-            )
-        except TypeError:
-            result_de = differential_evolution(
-                wls_objective, bounds=bounds_wls,
-                seed=0, tol=1e-6, maxiter=200, polish=False,
-                init='latinhypercube',
-            )
+        lower = np.array([b[0] for b in bounds_wls], dtype=float)
+        upper = np.array([b[1] for b in bounds_wls], dtype=float)
 
-        # L-BFGS-B polish
-        try:
-            result_lbfgs = sp_minimize(
-                wls_objective, x0=result_de.x,
-                method='L-BFGS-B', bounds=bounds_wls,
-                options={'ftol': 1e-12, 'maxiter': 400},
-            )
-            best_wls_x = result_lbfgs.x if result_lbfgs.fun < result_de.fun else result_de.x
-        except Exception:
+        # Deterministic multi-start set around the data-driven initial estimate.
+        # Each fit on ~n_lags points is sub-millisecond, so a small grid is free.
+        starts = []
+        for rf in (0.5, 1.0, 2.0):
+            for pf in (0.5, 1.0, 1.5):
+                cand = [psill0 * pf, range0 * rf, nugget0]
+                if has_alpha:
+                    cand.append(1.0)
+                starts.append(np.clip(np.asarray(cand, float), lower, upper))
+
+        best_wls_x = None
+        best_fun = np.inf
+        for s in starts:
+            try:
+                res = least_squares(
+                    wls_residuals, x0=s, bounds=(lower, upper),
+                    method='trf', xtol=1e-12, ftol=1e-12, max_nfev=400,
+                )
+                f = wls_objective(res.x)
+                if f < best_fun:
+                    best_fun, best_wls_x = f, res.x
+            except Exception:
+                continue
+
+        # Fallback: differential evolution if every least_squares start failed.
+        if best_wls_x is None:
+            print("       [fast-opt] least_squares failed — falling back to DE.", flush=True)
+            try:
+                result_de = differential_evolution(
+                    wls_objective, bounds=bounds_wls,
+                    seed=0, tol=1e-6, maxiter=200, polish=True, init='sobol',
+                )
+            except TypeError:
+                result_de = differential_evolution(
+                    wls_objective, bounds=bounds_wls,
+                    seed=0, tol=1e-6, maxiter=200, polish=True, init='latinhypercube',
+                )
             best_wls_x = result_de.x
 
         opt_psill = float(best_wls_x[0])
@@ -395,13 +440,13 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         opt_angle = 0.0
         opt_scaling = 1.0
 
-        skip_aniso = len(X) < 100
+        skip_aniso = len(X_emp) < 100
         if not skip_aniso:
             print("       [fast-opt] Stage 3: Directional anisotropy ...", flush=True)
             t3 = _time.perf_counter()
 
             dir_result = compute_empirical_variogram(
-                X, y, n_lags=n_lags, directions=[0, 45, 90, 135]
+                X_emp, y_emp, n_lags=n_lags, directions=[0, 45, 90, 135]
             )
 
             dir_ranges = {}
@@ -467,7 +512,7 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
                       + ", ".join(f"{d}°={r:.1f}" for d, r in sorted(dir_ranges.items())),
                       flush=True)
         else:
-            print(f"       [fast-opt] N={len(X)} < 100, skipping anisotropy",
+            print(f"       [fast-opt] N={len(X_emp)} < 100, skipping anisotropy",
                   flush=True)
 
         # ── Stage 4: Assemble params + single CV + final model ───────────────
@@ -482,42 +527,57 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         if has_alpha:
             self.best_params_['alpha'] = opt_alpha
 
-        # Single CV check for quality reporting
-        print("       [fast-opt] Stage 4: Single CV check ...", flush=True)
-        t5 = _time.perf_counter()
+        # Optional CV check for quality reporting. This is the only O(N^3) work in the
+        # pipeline (it builds + solves a kriging system per fold), and it is NOT needed
+        # to fit the empirical variogram — so it is off by default. When enabled, the
+        # folds are independent and run in parallel across all cores via joblib.
+        if compute_cv:
+            print("       [fast-opt] Stage 4: CV check (parallel) ...", flush=True)
+            t5 = _time.perf_counter()
 
-        fold_ids = make_spatial_block_folds(X, n_folds)
-        cv_errors_sq = []
-        sspe_values = []
+            fold_ids = make_spatial_block_folds(X, n_folds)
 
-        for fold in range(n_folds):
-            tr_idx = np.where(fold_ids != fold)[0]
-            te_idx = np.where(fold_ids == fold)[0]
-            if len(tr_idx) < 5 or len(te_idx) < 1:
-                continue
-            try:
-                ok = self._get_ok_instance(
-                    X[tr_idx], y[tr_idx], self.best_params_, model_name
-                )
-                y_pred, y_var = ok.execute('points', X[te_idx, 0], X[te_idx, 1])
-                y_pred = np.asarray(y_pred, dtype=np.float64)
-                y_var = np.asarray(y_var, dtype=np.float64)
-                residuals = y[te_idx] - y_pred
-                cv_errors_sq.extend((residuals ** 2).tolist())
-                std = np.sqrt(np.abs(y_var))
-                z_sq = (residuals / (std + 1e-12)) ** 2
-                sspe_values.extend(z_sq.tolist())
-            except Exception:
-                pass
+            def _run_fold(fold):
+                tr_idx = np.where(fold_ids != fold)[0]
+                te_idx = np.where(fold_ids == fold)[0]
+                if len(tr_idx) < 5 or len(te_idx) < 1:
+                    return None
+                try:
+                    ok = self._get_ok_instance(
+                        X[tr_idx], y[tr_idx], self.best_params_, model_name
+                    )
+                    y_pred, y_var = ok.execute('points', X[te_idx, 0], X[te_idx, 1])
+                    y_pred = np.asarray(y_pred, dtype=np.float64)
+                    y_var = np.asarray(y_var, dtype=np.float64)
+                    residuals = y[te_idx] - y_pred
+                    std = np.sqrt(np.abs(y_var))
+                    z_sq = (residuals / (std + 1e-12)) ** 2
+                    return (residuals ** 2).tolist(), z_sq.tolist()
+                except Exception:
+                    return None
 
-        t6 = _time.perf_counter()
-        if cv_errors_sq:
-            cv_rmse = float(np.sqrt(np.mean(cv_errors_sq)))
-            mean_sspe = float(np.mean(sspe_values)) if sspe_values else float('nan')
-            print(f"       [fast-opt] CV done in {t6 - t5:.2f}s: "
-                  f"RMSE={cv_rmse:.4f}, mean_SSPE={mean_sspe:.3f}", flush=True)
+            from joblib import Parallel, delayed
+            n_jobs = self.n_jobs if self.n_jobs and self.n_jobs != 1 else -1
+            fold_out = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_run_fold)(fold) for fold in range(n_folds)
+            )
+
+            cv_errors_sq, sspe_values = [], []
+            for item in fold_out:
+                if item is not None:
+                    cv_errors_sq.extend(item[0])
+                    sspe_values.extend(item[1])
+
+            t6 = _time.perf_counter()
+            if cv_errors_sq:
+                cv_rmse = float(np.sqrt(np.mean(cv_errors_sq)))
+                mean_sspe = float(np.mean(sspe_values)) if sspe_values else float('nan')
+                print(f"       [fast-opt] CV done in {t6 - t5:.2f}s: "
+                      f"RMSE={cv_rmse:.4f}, mean_SSPE={mean_sspe:.3f}", flush=True)
+            else:
+                print(f"       [fast-opt] CV: no valid folds", flush=True)
         else:
-            print(f"       [fast-opt] CV: no valid folds", flush=True)
+            print("       [fast-opt] Stage 4: CV skipped (compute_cv=False).", flush=True)
 
         # Build final model on all data
         self.model_ = self._get_ok_instance(X, y, self.best_params_, model_name)

@@ -535,10 +535,30 @@ def run_pipeline():
             model_name=kriging_model,
             n_lags=kriging_nlags,
             n_folds=engine_cfg.get("kriging", {}).get("n_splits", 5),
+            compute_cv=engine_cfg.get("kriging", {}).get("compute_cv", False),
         )
     elif gp_preset:
         print("       [preset] Using UI-supplied GP kernel parameters — skipping Optuna.")
         model.fit_with_known_params(X, Z_fit, gp_preset)
+    elif mode == "kriging":
+        # No preset and no model selected. The legacy Optuna search (slow: 300 trials
+        # x CV x O(N^3), minutes even at N=500) must never run by accident — it is the
+        # documented cause of "extremely slow" fits. Default to the fast deterministic
+        # optimizer unless the user explicitly opts into the legacy search.
+        if engine_cfg.get("kriging", {}).get("legacy_search", False):
+            print("       [legacy] kriging.legacy_search=true — running Optuna search (slow).")
+            model.fit(X, Z_fit)
+        else:
+            print(f"       [deterministic] No model specified — defaulting to "
+                  f"'spherical' with {kriging_nlags} lags (set engine.kriging.model "
+                  f"to choose another, or legacy_search: true for the old Optuna path).")
+            model.fit_deterministic(
+                X, Z_fit,
+                model_name="spherical",
+                n_lags=kriging_nlags,
+                n_folds=engine_cfg.get("kriging", {}).get("n_splits", 5),
+                compute_cv=engine_cfg.get("kriging", {}).get("compute_cv", False),
+            )
     else:
         model.fit(X, Z_fit)
     elapsed = time.time() - t0

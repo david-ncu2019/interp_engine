@@ -74,15 +74,28 @@ preprocessing:
 # ------------------------------------------------------------------------------
 engine:
   # The interpolation algorithm to use: 'kriging' or 'gp' (Gaussian Process)
-  mode: kriging
+  mode: gp
   
   kriging:
+    # Variogram model to fit. Setting this uses the FAST deterministic optimizer
+    # (fit_deterministic: WLS fit to the empirical variogram + directional anisotropy,
+    # ~1s for 500 pts). Options: spherical, exponential, gaussian, hole-effect,
+    # matern_32, matern_52, stable, circular, rational-quadratic, linear, power.
+    # If you omit 'model', the engine still defaults to fast deterministic 'spherical'.
+    model: spherical
+    # Number of distance bins for the empirical variogram (user-chosen lag count).
+    n_lags: 12
     # Maximum allowed anisotropy ratio for the spatial variogram.
     max_anisotropy: 10.0
-    # Number of cross-validation splits for hyperparameter tuning.
-    n_splits: 5
-    # Number of Optuna trials for finding the best variogram parameters.
-    n_trials: 100
+    # Number of cross-validation splits (only used if compute_cv / legacy_search).
+    n_splits: 3
+    # Set true to also compute cross-validation RMSE/SSPE during the fit (slower).
+    compute_cv: false
+    # Set true ONLY to use the deprecated, slow Optuna search instead of the fast
+    # deterministic optimizer. n_trials applies to that legacy path.
+    legacy_search: false
+    # Number of Optuna trials for the legacy search path (ignored unless legacy_search).
+    n_trials: 300
     
   gp:
     # Angle bounds for the anisotropy ellipse search (in degrees).
