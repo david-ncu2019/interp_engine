@@ -92,8 +92,11 @@ class WorkspaceController(QObject):
         from ui.live_predictor import compute_preview
         self.statusMessage.emit("Computing live preview…")
         try:
-            res = compute_preview(self._engine, self._X, self._y,
-                                  self._on_slider_preset, n_cells=40)
+            # Suppress engine diagnostic prints (noise in the UI)
+            import io, contextlib
+            with contextlib.redirect_stdout(io.StringIO()):
+                res = compute_preview(self._engine, self._X, self._y,
+                                      self._on_slider_preset, n_cells=40)
             self.resultReady.emit({"preview": True, "grid": res})
             self.statusMessage.emit("Live preview updated.")
         except Exception as exc:

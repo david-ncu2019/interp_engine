@@ -32,6 +32,7 @@ class GeospatialApp(QMainWindow):
         super().__init__()
         self.setWindowTitle("Interpolation Engine")
         self.resize(1400, 900)
+        self.setMinimumSize(800, 500)
 
         self._ctrl = WorkspaceController(self)
 
@@ -509,7 +510,9 @@ class GeospatialApp(QMainWindow):
         s = QSettings("InterpEngine", "GeospatialApp")
         geo = s.value("geometry")
         if geo:
-            self.restoreGeometry(geo)
+            ok = self.restoreGeometry(geo)
+            if not ok:
+                self.resize(1400, 900)  # fallback if restored size doesn't fit
         ws = s.value("windowState")
         if ws:
             self.restoreState(ws)
