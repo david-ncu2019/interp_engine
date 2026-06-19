@@ -17,6 +17,7 @@ class WorkspaceController(QObject):
     statusMessage = Signal(str)
     metricsUpdated = Signal(dict)       # {mae, rmse, r2, mean_sspe, rmss}
     resultReady = Signal(dict)          # full result dict with grid/cv_df/params
+    paramsReady = Signal(dict)           # optimized parameters from auto-fit
     dataLoaded = Signal()               # X/y are now available
 
     def __init__(self, parent=None):
@@ -26,6 +27,7 @@ class WorkspaceController(QObject):
         self._engine = "kriging"
         self._live = True
         self._last_full = None
+        self._auto_fit_dir = None        # temp dir for auto-fit (read params after)
         self._on_slider_preset = {
             "model": "spherical", "psill": 5.0, "range": 300,
             "nugget": 0.5, "angle_deg": 0.0, "anisotropy_ratio": 1.0}
@@ -126,7 +128,9 @@ class WorkspaceController(QObject):
             return
         self._proc.kill()
         self._proc.waitForFinished(500)
+        self._auto_fit_dir = tempfile.mkdtemp(prefix="interp_autoopt_")
         state = dict(self._state)
+        state["output_dir"] = self._auto_fit_dir
         state["save_diagnostics"] = False
         state["resolution_m"] = 200.0
         state["export_formats"] = ["nc"]
@@ -154,7 +158,23 @@ class WorkspaceController(QObject):
             pass
         if exit_code != 0:
             self.statusMessage.emit(f"Engine exited with code {exit_code}")
+            self._auto_fit_dir = None
             return
+        # ── Auto-fit: read optimized parameters from the temp output dir ──
+        af_dir = getattr(self, "_auto_fit_dir", None)
+        if af_dir:
+            self._auto_fit_dir = None
+            params_file = Path(af_dir) / f"parameters_{self._engine}.json"
+            if params_file.exists():
+                import json as _json
+                with open(params_file) as f:
+                    params = _json.load(f)
+                self.paramsReady.emit(params)
+                self.statusMessage.emit("Auto-fit complete — controls updated.")
+            else:
+                self.statusMessage.emit("Auto-fit finished — no parameters found.")
+            return
+        # ── Full run: load the bundle ──
         bd = getattr(self, "_bundle_dir", None)
         if not bd:
             return

@@ -78,9 +78,24 @@ class GeospatialApp(QMainWindow):
         # Section 2: Variogram Controls
         sec_vario = sb.addSection("Variogram Controls")
         vw = QWidget(); vl = QVBoxLayout(vw); vl.setContentsMargins(4, 4, 4, 4)
-        self._model_dropdown = QComboBox()
-        self._model_dropdown.addItems(list(VARIOGRAM_MODELS.keys()))
-        vl.addWidget(QLabel("Model:")); vl.addWidget(self._model_dropdown)
+        # Kriging: variogram model dropdown
+        self._krig_model_label = QLabel("Variogram Model:")
+        self._krig_model_combo = QComboBox()
+        self._krig_model_combo.addItems(list(VARIOGRAM_MODELS.keys()))
+        vl.addWidget(self._krig_model_label)
+        vl.addWidget(self._krig_model_combo)
+        # GP: kernel type dropdown (hidden by default)
+        self._gp_kernel_label = QLabel("Kernel Type:")
+        self._gp_kernel_combo = QComboBox()
+        self._gp_kernel_combo.addItems([
+            "matern_32 — Matérn-3/2  (rough, C¹)",
+            "matern_52 — Matérn-5/2  (moderate, C²)",
+            "rbf — RBF  (smooth, C∞)",
+        ])
+        self._gp_kernel_label.setVisible(False)
+        self._gp_kernel_combo.setVisible(False)
+        vl.addWidget(self._gp_kernel_label)
+        vl.addWidget(self._gp_kernel_combo)
         self._sliders = {}
         for name, mn, mx, df in [
             ("Range", 1, 5000, 300), ("Sill (psill)", 0.001, 50, 5.0),
@@ -174,7 +189,8 @@ class GeospatialApp(QMainWindow):
         for cb in (self._col_x, self._col_y, self._col_z):
             cb.currentTextChanged.connect(lambda: self._try_load())
         self._eng_group.buttonToggled.connect(self._on_engine_changed)
-        self._model_dropdown.currentTextChanged.connect(self._fire_sliders)
+        self._krig_model_combo.currentTextChanged.connect(self._fire_sliders)
+        self._gp_kernel_combo.currentTextChanged.connect(self._fire_sliders)
         for sl in self._sliders.values():
             sl.valueChanged.connect(lambda v: self._fire_sliders())
         self._live_cb.toggled.connect(c.set_live)
@@ -184,6 +200,7 @@ class GeospatialApp(QMainWindow):
         c.logLine.connect(self._log.appendLine)
         c.statusMessage.connect(self._status_label.setText)
         c.metricsUpdated.connect(self._on_metrics)
+        c.paramsReady.connect(self._on_params_ready)
         c.resultReady.connect(self._on_result)
 
     def _on_file_selected(self, path):
@@ -212,25 +229,32 @@ class GeospatialApp(QMainWindow):
         mode = "gp" if btn is self._radio_gp else "kriging"
         self._ctrl.set_engine(mode)
         is_krig = mode == "kriging"
-        self._model_dropdown.setVisible(is_krig)
+        self._krig_model_label.setVisible(is_krig)
+        self._krig_model_combo.setVisible(is_krig)
+        self._gp_kernel_label.setVisible(not is_krig)
+        self._gp_kernel_combo.setVisible(not is_krig)
         for name in ("Sill (psill)", "Nugget", "Alpha"):
             if name in self._sliders:
                 self._sliders[name].setVisible(is_krig)
 
     def _fire_sliders(self, *_):
-        preset = {"model": self._model_dropdown.currentText()}
-        for n, sl in self._sliders.items():
-            if n == "Range": preset["range"] = sl.value()
-            elif n == "Sill (psill)": preset["psill"] = sl.value()
-            elif n == "Nugget": preset["nugget"] = sl.value()
-            elif n == "Angle (°)": preset["angle_deg"] = sl.value()
-            elif n == "Anisotropy ×": preset["anisotropy_ratio"] = sl.value()
-            elif n == "Alpha": preset["alpha"] = sl.value()
         if self._ctrl._engine == "gp":
-            preset = {"kernel_type": "matern_52",
+            # Parse kernel type from display name like "matern_52 — Matérn-5/2  (moderate, C²)"
+            kt_text = self._gp_kernel_combo.currentText()
+            kt = kt_text.split(" ")[0] if kt_text else "matern_52"
+            preset = {"kernel_type": kt,
                        "length_scale_major": self._sliders["Range"].value(),
                        "anisotropy_ratio": self._sliders["Anisotropy ×"].value(),
                        "angle_deg": self._sliders["Angle (°)"].value()}
+        else:
+            preset = {"model": self._krig_model_combo.currentText()}
+            for n, sl in self._sliders.items():
+                if n == "Range": preset["range"] = sl.value()
+                elif n == "Sill (psill)": preset["psill"] = sl.value()
+                elif n == "Nugget": preset["nugget"] = sl.value()
+                elif n == "Angle (°)": preset["angle_deg"] = sl.value()
+                elif n == "Anisotropy ×": preset["anisotropy_ratio"] = sl.value()
+                elif n == "Alpha": preset["alpha"] = sl.value()
         self._ctrl.on_slider_change(preset)
         self._redraw_vario_fit(preset)
 
@@ -300,6 +324,38 @@ class GeospatialApp(QMainWindow):
             ax.plot(h, gam, color="#d62728", lw=2, label=preset.get("model", "?"))
             ax.legend(fontsize=9)
         dp.canvas.draw_idle()
+
+    def _on_params_ready(self, params: dict):
+        """Auto-fit completed — populate sliders + redraw variogram fit."""
+        import numpy as np
+        if "best_model" in params:  # kriging
+            self._krig_model_combo.setCurrentText(params["best_model"])
+        if "range" in params:
+            self._sliders["Range"].setValue(float(params["range"]))
+        if "psill" in params:
+            self._sliders["Sill (psill)"].setValue(float(params["psill"]))
+        if "nugget" in params:
+            self._sliders["Nugget"].setValue(float(params["nugget"]))
+        if "rotation_angle_deg" in params:
+            self._sliders["Angle (°)"].setValue(float(params["rotation_angle_deg"]))
+        if "anisotropy_ratio" in params:
+            self._sliders["Anisotropy ×"].setValue(
+                min(float(params["anisotropy_ratio"]), 15.0))
+        if "alpha" in params:
+            self._sliders["Alpha"].setValue(float(params["alpha"]))
+        # GP params
+        if "kernel_type" in params:
+            kt = params["kernel_type"]
+            for i in range(self._gp_kernel_combo.count()):
+                if self._gp_kernel_combo.itemText(i).startswith(kt):
+                    self._gp_kernel_combo.setCurrentIndex(i)
+                    break
+        ls = params.get("length_scale")
+        if ls is not None:
+            if isinstance(ls, (list, tuple)) and len(ls):
+                self._sliders["Range"].setValue(float(max(ls)))
+        # Redraw with new params
+        self._fire_sliders()
 
     def _on_metrics(self, m: dict):
         def g(k):
