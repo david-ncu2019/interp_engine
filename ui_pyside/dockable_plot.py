@@ -1,25 +1,17 @@
-"""DockablePlot — QDockWidget containing an MplCanvas, detachable for multi-monitor."""
-from PySide6.QtWidgets import QDockWidget, QWidget, QVBoxLayout
-from PySide6.QtCore import Qt
+"""PlotPanel — QWidget containing an MplCanvas, for the 2×2 plot grid."""
+from PySide6.QtWidgets import QWidget, QVBoxLayout
 from ui_pyside.mpl_canvas import MplCanvas
 
 
-class DockablePlot(QDockWidget):
-    def __init__(self, title="Plot", object_name="PlotDock", parent=None):
-        super().__init__(title, parent)
-        self.setObjectName(object_name)
-        self.setFeatures(
-            QDockWidget.DockWidgetMovable |
-            QDockWidget.DockWidgetClosable |
-            QDockWidget.DockWidgetFloatable)
-        self.setAllowedAreas(Qt.AllDockWidgetAreas)
-
-        container = QWidget()
-        layout = QVBoxLayout(container)
+class PlotPanel(QWidget):
+    def __init__(self, title="Plot", parent=None):
+        super().__init__(parent)
+        self._title = title
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
-
         self.canvas = MplCanvas(figsize=(5.0, 3.5), dpi=96)
         layout.addWidget(self.canvas, 1)
 
-        self.setWidget(container)
+    def title(self) -> str:
+        return self._title

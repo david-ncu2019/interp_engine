@@ -12,14 +12,14 @@ from PySide6.QtWidgets import (
     QMainWindow, QApplication, QSplitter, QStatusBar, QLabel,
     QMenuBar, QMenu, QMessageBox, QWidget, QGridLayout, QVBoxLayout,
     QRadioButton, QCheckBox, QComboBox, QPushButton, QButtonGroup,
-    QFileDialog, QDialog, QDialogButtonBox,
+    QFileDialog, QDialog, QDialogButtonBox, QSpinBox,
 )
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction, QKeySequence
 
 from ui_pyside.accordion_sidebar import AccordionSidebar
 from ui_pyside.animated_slider import AnimatedSlider
-from ui_pyside.dockable_plot import DockablePlot
+from ui_pyside.dockable_plot import PlotPanel
 from ui_pyside.file_picker import FilePicker
 from ui_pyside.log_console import LogConsole
 from ui_pyside.workspace_controller import WorkspaceController
@@ -128,7 +128,6 @@ class GeospatialApp(QMainWindow):
         self._gp_notice.setVisible(False)
         vl.addWidget(self._gp_notice)
         # Number of lags (Kriging only)
-        from PySide6.QtWidgets import QSpinBox
         self._nlags_label = QLabel("Number of lags:")
         self._nlags_spin = QSpinBox()
         self._nlags_spin.setRange(4, 50)
@@ -222,15 +221,15 @@ class GeospatialApp(QMainWindow):
         grid.setContentsMargins(2, 2, 2, 2)
         grid.setSpacing(4)
         self._plots = {}
-        for (row, col, name, objname) in [
-            (0, 0, "Prediction Surface", "SurfaceDock"),
-            (0, 1, "Uncertainty (std)", "UncertaintyDock"),
-            (1, 0, "Variogram Fit", "VarioDock"),
-            (1, 1, "CV Dashboard", "CVDock"),
+        for (row, col, name) in [
+            (0, 0, "Prediction Surface"),
+            (0, 1, "Uncertainty (std)"),
+            (1, 0, "Variogram Fit"),
+            (1, 1, "CV Dashboard"),
         ]:
-            dp = DockablePlot(title=name, object_name=objname)
-            self._plots[name] = dp
-            grid.addWidget(dp, row, col)
+            pp = PlotPanel(title=name)
+            self._plots[name] = pp
+            grid.addWidget(pp, row, col)
         return container
 
     # ── menus ────────────────────────────────────────────────────────
@@ -244,9 +243,6 @@ class GeospatialApp(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction("E&xit", self.close, QKeySequence("Ctrl+Q"))
         view_menu = mb.addMenu("&View")
-        for name in self._plots:
-            view_menu.addAction(self._plots[name].toggleViewAction())
-        view_menu.addSeparator()
         view_menu.addAction("&Reset Layout", self._reset_layout)
         analysis_menu = mb.addMenu("&Analysis")
         analysis_menu.addAction("&Run Full-res", self._ctrl.run_full,
@@ -352,16 +348,21 @@ class GeospatialApp(QMainWindow):
             self._draw_cv(cv_df)
 
     def _draw_surface(self, grid):
+        # Accept both full-run keys (xv/yv) and live-preview keys (X_grid/Y_grid)
+        xg = grid.get("xv", grid.get("X_grid"))
+        yg = grid.get("yv", grid.get("Y_grid"))
+        if xg is None:
+            return
         for dp_name, data_key, cmap, title in [
             ("Prediction Surface", "mean", "viridis", "Predicted Mean"),
             ("Uncertainty (std)", "std", "magma_r", "Uncertainty (std)"),
         ]:
             dp = self._plots.get(dp_name)
-            if dp is None or "xv" not in grid:
+            if dp is None:
                 continue
             fig = dp.canvas.fig; fig.clear(); ax = fig.add_subplot(111)
             try:
-                c = ax.contourf(grid["xv"], grid["yv"], grid[data_key],
+                c = ax.contourf(xg, yg, grid[data_key],
                                  levels=30, cmap=cmap, extend="both")
                 fig.colorbar(c, ax=ax, fraction=0.046)
             except Exception:
@@ -502,8 +503,6 @@ class GeospatialApp(QMainWindow):
             self._ctrl._state["output_dir"] = d
 
     def _reset_layout(self):
-        for dp in self._plots.values():
-            dp.setFloating(False)
         self._sidebar.expandSection(0)
 
     def _restore_state(self):
@@ -513,14 +512,10 @@ class GeospatialApp(QMainWindow):
             ok = self.restoreGeometry(geo)
             if not ok:
                 self.resize(1400, 900)  # fallback if restored size doesn't fit
-        ws = s.value("windowState")
-        if ws:
-            self.restoreState(ws)
 
     def closeEvent(self, event):
         s = QSettings("InterpEngine", "GeospatialApp")
         s.setValue("geometry", self.saveGeometry())
-        s.setValue("windowState", self.saveState())
         event.accept()
 
 
