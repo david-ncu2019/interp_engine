@@ -1,5 +1,5 @@
 """WorkspaceController — pure signal/slot mediator, no widgets."""
-import os, sys, json, tempfile, csv, shutil
+import os, sys, json, re, tempfile, csv, shutil
 from pathlib import Path
 import numpy as np
 
@@ -21,6 +21,9 @@ class WorkspaceController(QObject):
     resultReady = Signal(dict)          # full result dict with grid/cv_df/params
     paramsReady = Signal(dict)           # optimized parameters from auto-fit
     dataLoaded = Signal()               # X/y are now available
+    progressChanged = Signal(int, str)  # (percent 0-100, label) — determinate subprocess progress
+    busyStarted = Signal(str)           # (label) — indeterminate long op started
+    busyFinished = Signal()             # long op finished (success or failure)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -47,8 +50,16 @@ class WorkspaceController(QObject):
             "model": "spherical", "psill": 5.0, "range": 300,
             "nugget": 0.5, "angle_deg": 0.0, "anisotropy_ratio": 1.0}
 
+        # Live preview and auto-fit run in raw space (detrend/NST forced off)
+        # so the variogram plot, sliders, and optimized params are always in
+        # consistent units. The full "Run Interpolation" respects the user's
+        # preprocessing choices from the sidebar — the subprocess applies
+        # transform → fit → back-transform so results stay in original units.
         self._state = {"engine_mode": "kriging", "output_dir": "output",
-                       "save_diagnostics": True, "export_formats": ["nc"]}
+                       "save_diagnostics": True, "export_formats": ["nc"],
+                       "detrend_auto": False, "detrend_enabled": False,
+                       "detrend_order": 1,
+                       "nst_enabled": False}
 
         # Debounce timer for live preview (single-shot, 300ms)
         self._debounce = QTimer(self)
@@ -85,8 +96,10 @@ class WorkspaceController(QObject):
         self._state["col_y"] = col_y
         self._state["col_value"] = col_val
         self.dataLoaded.emit()
+        # Do NOT auto-render a prediction on bare load. The user hasn't fit or
+        # run anything yet; main_window draws the empirical variogram instead.
+        # Live preview is preserved for genuine interaction (slider / Run / Optimize).
         self.statusMessage.emit(f"Loaded {len(self._y)} points.")
-        self._compute_preview()
 
     def set_engine(self, mode: str):
         self._engine = mode
@@ -94,6 +107,14 @@ class WorkspaceController(QObject):
 
     def set_live(self, enabled: bool):
         self._live = enabled
+
+    def set_preprocessing(self, detrend_enabled: bool, detrend_order: int,
+                          detrend_auto: bool, nst_enabled):
+        """Update preprocessing flags. None for nst_enabled means auto-detect."""
+        self._state["detrend_enabled"] = detrend_enabled
+        self._state["detrend_order"] = detrend_order
+        self._state["detrend_auto"] = detrend_auto
+        self._state["nst_enabled"] = nst_enabled  # True/False/None
 
     def on_slider_change(self, preset: dict):
         self._on_slider_preset = preset
@@ -105,6 +126,9 @@ class WorkspaceController(QObject):
         if self._X is None or not self._live:
             return
         from ui.live_predictor import compute_preview
+        # Inline preview blocks the main thread; flip the busy indicator on so it
+        # paints before the (brief) compute, then off when done.
+        self.busyStarted.emit("Computing live preview…")
         self.statusMessage.emit("Computing live preview…")
         try:
             # Suppress engine diagnostic prints (noise in the UI)
@@ -117,6 +141,8 @@ class WorkspaceController(QObject):
         except Exception as exc:
             msg = str(exc).split("\n")[0]  # first line only (Qhull diagnostics are noisy)
             self.statusMessage.emit(f"Preview failed: {msg}")
+        finally:
+            self.busyFinished.emit()
 
     # ------------------------------------------------------------------
     # Full run (subprocess via QProcess)
@@ -130,15 +156,20 @@ class WorkspaceController(QObject):
         state["ui_mode"] = True
         state["bundle_dir"] = self._bundle_dir
         state["engine_mode"] = self._engine
+        # Run uses the current slider values directly (instant, no optimization).
+        # build_config() reads the FLAT keys kriging_preset / gp_preset — writing the
+        # nested kriging.preset_params here would be silently dropped, leaving the
+        # config with no model and no preset → main.py falls through to the slow
+        # legacy Optuna fit().
         preset = self._on_slider_preset
         if self._engine == "kriging" and preset:
-            state["kriging"] = state.get("kriging", {})
-            state["kriging"]["preset_params"] = preset
+            state["kriging_preset"] = preset
         elif self._engine == "gp" and preset:
-            state["gp"] = state.get("gp", {})
-            state["gp"]["preset_params"] = preset
+            state["gp_preset"] = preset
         cfg_path = _write_temp_config(state)
         self.statusMessage.emit("Running full-resolution interpolation…")
+        self.busyStarted.emit("Running full-resolution interpolation…")
+        self.progressChanged.emit(0, "Starting…")
         # Apply DLL-safe subprocess environment
         env = QProcessEnvironment()
         for k, v in self._proc_env.items():
@@ -154,6 +185,12 @@ class WorkspaceController(QObject):
         self._proc.waitForFinished(500)
         self._auto_fit_dir = tempfile.mkdtemp(prefix="autoopt_", dir=str(_TEMP_ROOT))
         state = dict(self._state)
+        # Auto-fit MUST run in raw space so returned params match the
+        # raw empirical variogram and sliders (NST/detrend transforms
+        # would change the units of psill/nugget/range).
+        state["detrend_enabled"] = False
+        state["detrend_auto"] = False
+        state["nst_enabled"] = False
         state["output_dir"] = self._auto_fit_dir
         state["save_diagnostics"] = False
         state["resolution_m"] = 200.0
@@ -166,6 +203,8 @@ class WorkspaceController(QObject):
         state["engine_mode"] = self._engine
         cfg_path = _write_temp_config(state)
         self.statusMessage.emit("Auto-fitting parameters…")
+        self.busyStarted.emit("Auto-fitting parameters…")
+        self.progressChanged.emit(0, "Starting…")
         # Apply DLL-safe subprocess environment
         env = QProcessEnvironment()
         for k, v in self._proc_env.items():
@@ -174,13 +213,27 @@ class WorkspaceController(QObject):
         self._proc.start(sys.executable, [str(PROJECT_ROOT / "main.py"), cfg_path])
         self._last_cfg_path = cfg_path
 
+    # Stage markers main.py prints, e.g. "[5/7] Fitting model ...".
+    _STAGE_RE = re.compile(r"\[(\d+)\s*/\s*(\d+)\]\s*(.*)")
+
     def _on_stdout(self):
         data = self._proc.readAllStandardOutput().data().decode("utf-8", errors="replace")
         for line in data.splitlines():
-            if line.strip():
-                self.logLine.emit(line.strip())
+            s = line.strip()
+            if not s:
+                continue
+            self.logLine.emit(s)
+            m = self._STAGE_RE.search(s)
+            if m:
+                k, total = int(m.group(1)), int(m.group(2))
+                pct = int(round(100.0 * k / max(total, 1)))
+                label = m.group(3).strip() or f"Step {k}/{total}"
+                self.progressChanged.emit(min(pct, 100), f"[{k}/{total}] {label}")
 
     def _on_run_complete(self, exit_code):
+        # Reset/hide the progress indicator no matter how this run ends.
+        self.progressChanged.emit(0, "")
+        self.busyFinished.emit()
         try:
             os.unlink(getattr(self, "_last_cfg_path", ""))
         except OSError:

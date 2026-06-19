@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QMenuBar, QMenu, QMessageBox, QWidget, QGridLayout, QVBoxLayout,
     QRadioButton, QCheckBox, QComboBox, QPushButton, QButtonGroup,
     QFileDialog, QDialog, QDialogButtonBox, QSpinBox, QTabWidget,
+    QProgressBar,
 )
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction, QKeySequence
@@ -88,7 +89,68 @@ class GeospatialApp(QMainWindow):
         sec_data.setContent(dw)
         sec_data.expand()
 
-        # Section 2: Variogram Controls
+        # Section 2: Preprocessing
+        sec_preproc = sb.addSection("Preprocessing")
+        pw = QWidget(); pl = QVBoxLayout(pw); pl.setContentsMargins(4, 4, 4, 4)
+
+        # Detrend controls
+        detrend_w = QWidget(); dl2 = QVBoxLayout(detrend_w); dl2.setContentsMargins(0, 0, 0, 0)
+        dl2.addWidget(QLabel("Detrend:"))
+        self._detrend_cb = QCheckBox("Enabled")
+        self._detrend_cb.setToolTip(
+            "Subtract a polynomial trend surface before fitting.\n"
+            "Useful when your data has a regional gradient\n"
+            "(e.g., groundwater flow, elevation slope).")
+        self._detrend_cb.setChecked(False)
+        dl2.addWidget(self._detrend_cb)
+
+        order_row = QWidget(); orl = QVBoxLayout(order_row); orl.setContentsMargins(20, 0, 0, 0)
+        orl.addWidget(QLabel("Polynomial degree:"))
+        self._detrend_order_cb = QComboBox()
+        self._detrend_order_cb.addItems(["1 — linear plane", "2 — quadratic", "3 — cubic"])
+        self._detrend_order_cb.setToolTip(
+            "Order of the polynomial trend surface.\n"
+            "1 = flat dipping plane (most common).\n"
+            "2 = bowl/dome shape. 3 = complex undulations.")
+        orl.addWidget(self._detrend_order_cb)
+        dl2.addWidget(order_row)
+
+        self._detrend_auto_cb = QCheckBox("Auto-detect (F-test)")
+        self._detrend_auto_cb.setToolTip(
+            "When checked: the engine decides whether to detrend\n"
+            "based on a statistical F-test of the polynomial fit.\n"
+            "The 'Enabled' checkbox above is ignored when auto-detect is on.")
+        self._detrend_auto_cb.setChecked(False)
+        dl2.addWidget(self._detrend_auto_cb)
+        pl.addWidget(detrend_w)
+
+        # NST controls
+        nst_row = QWidget(); nrl = QVBoxLayout(nst_row); nrl.setContentsMargins(0, 6, 0, 0)
+        nrl.addWidget(QLabel("Normal Score Transform (NST):"))
+        self._nst_combo = QComboBox()
+        self._nst_combo.addItems(["Off", "On", "Auto"])
+        self._nst_combo.setToolTip(
+            "Transform data to a standard normal distribution before fitting.\n"
+            "Essential for strongly skewed data (e.g., ore grades, rainfall).\n"
+            "Off = never transform. On = always transform.\n"
+            "Auto = let the engine decide (Shapiro-Wilk normality test).")
+        nrl.addWidget(self._nst_combo)
+        pl.addWidget(nst_row)
+
+        # Info notice
+        info = QLabel(
+            "These settings only apply to \"Run Interpolation\".\n"
+            "Live preview and \"Optimize Parameters\" always\n"
+            "use raw data to keep the variogram plot consistent.")
+        info.setWordWrap(True)
+        info.setStyleSheet(
+            "QLabel { color: palette(placeholder-text); font-style: italic; "
+            "padding: 4px; font-size: 10px; }")
+        pl.addWidget(info)
+
+        sec_preproc.setContent(pw)
+
+        # Section 3: Variogram Controls
         sec_vario = sb.addSection("Variogram Controls")
         vw = QWidget(); vl = QVBoxLayout(vw); vl.setContentsMargins(4, 4, 4, 4)
         # Kriging: variogram model dropdown
@@ -200,7 +262,7 @@ class GeospatialApp(QMainWindow):
         vl.addWidget(btn_row)
         sec_vario.setContent(vw)
 
-        # Section 3: Engine Options (collapsed)
+        # Section 4: Engine Options (collapsed)
         sec_eng = sb.addSection("Engine Options")
         ew = QWidget(); el2 = QVBoxLayout(ew)
         el2.addWidget(QLabel("GP optimization trials:"))
@@ -210,7 +272,7 @@ class GeospatialApp(QMainWindow):
         el2.addWidget(self._gp_trials_cb)
         sec_eng.setContent(ew)
 
-        # Section 4: Log (collapsed)
+        # Section 5: Log (collapsed)
         sec_log = sb.addSection("Log")
         self._log = LogConsole()
         sec_log.setContent(self._log)
@@ -270,7 +332,12 @@ class GeospatialApp(QMainWindow):
         self._metrics_label = QLabel(
             "MAE —    RMSE —    R² —    mean_SSPE —    RMSS —")
         self._status_label = QLabel("Ready")
+        self._progress = QProgressBar()
+        self._progress.setFixedWidth(180)
+        self._progress.setTextVisible(True)
+        self._progress.setVisible(False)        # hidden when idle
         self.statusBar().addWidget(self._metrics_label, 1)
+        self.statusBar().addPermanentWidget(self._progress)
         self.statusBar().addPermanentWidget(self._status_label)
 
     # ── wiring ───────────────────────────────────────────────────────
@@ -288,12 +355,19 @@ class GeospatialApp(QMainWindow):
         self._run_btn.clicked.connect(c.run_full)
         self._auto_btn.clicked.connect(c.auto_fit)
         self._export_btn.clicked.connect(self._export)
+        self._detrend_cb.toggled.connect(self._on_preproc_changed)
+        self._detrend_order_cb.currentIndexChanged.connect(self._on_preproc_changed)
+        self._detrend_auto_cb.toggled.connect(self._on_preproc_changed)
+        self._nst_combo.currentIndexChanged.connect(self._on_preproc_changed)
         c.logLine.connect(self._log.appendLine)
         c.statusMessage.connect(self._status_label.setText)
-        c.dataLoaded.connect(self._compute_directional)
+        c.dataLoaded.connect(self._on_data_loaded)
         c.metricsUpdated.connect(self._on_metrics)
         c.paramsReady.connect(self._on_params_ready)
         c.resultReady.connect(self._on_result)
+        c.progressChanged.connect(self._on_progress)
+        c.busyStarted.connect(self._on_busy_started)
+        c.busyFinished.connect(self._on_busy_finished)
 
     def _on_file_selected(self, path):
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -313,7 +387,7 @@ class GeospatialApp(QMainWindow):
         cz = self._col_z.currentText()
         if fp and cx and cy and cz:
             self._ctrl.load_data(fp, cx, cy, cz)
-            self._sidebar.expandSection(1)
+            self._sidebar.expandSection(2)  # Variogram Controls (now section index 2)
 
     def _on_engine_changed(self, btn, checked):
         if not checked:
@@ -332,31 +406,70 @@ class GeospatialApp(QMainWindow):
             if name in self._sliders:
                 self._sliders[name].setVisible(is_krig)
 
-    def _fire_sliders(self, *_):
+    def _on_preproc_changed(self, *_):
+        detrend_enabled = self._detrend_cb.isChecked()
+        detrend_order = self._detrend_order_cb.currentIndex() + 1  # 1, 2, 3
+        detrend_auto = self._detrend_auto_cb.isChecked()
+        nst_mode = self._nst_combo.currentIndex()  # 0=Off, 1=On, 2=Auto
+        nst_enabled = {0: False, 1: True, 2: None}[nst_mode]
+        self._ctrl.set_preprocessing(detrend_enabled, detrend_order,
+                                     detrend_auto, nst_enabled)
+
+    def _current_preset(self) -> dict:
+        """Build the preset dict from the current engine + slider/combo state."""
         if self._ctrl._engine == "gp":
             # Parse kernel type from display name like "matern_52 — Matérn-5/2  (moderate, C²)"
             kt_text = self._gp_kernel_combo.currentText()
             kt = kt_text.split(" ")[0] if kt_text else "matern_52"
-            preset = {"kernel_type": kt,
-                       "length_scale_major": self._sliders["Range"].value(),
-                       "anisotropy_ratio": self._sliders["Anisotropy ×"].value(),
-                       "angle_deg": self._sliders["Angle (°)"].value()}
-        else:
-            preset = {"model": self._krig_model_combo.currentData()}
-            for n, sl in self._sliders.items():
-                if n == "Range": preset["range"] = sl.value()
-                elif n == "Sill (psill)": preset["psill"] = sl.value()
-                elif n == "Nugget": preset["nugget"] = sl.value()
-                elif n == "Angle (°)": preset["angle_deg"] = sl.value()
-                elif n == "Anisotropy ×": preset["anisotropy_ratio"] = sl.value()
-                elif n == "Alpha": preset["alpha"] = sl.value()
-        self._ctrl._state["kriging_n_lags"] = self._nlags_spin.value()
-        self._ctrl.on_slider_change(preset)
-        # Redraw all three variogram tabs
+            return {"kernel_type": kt,
+                    "length_scale_major": self._sliders["Range"].value(),
+                    "anisotropy_ratio": self._sliders["Anisotropy ×"].value(),
+                    "angle_deg": self._sliders["Angle (°)"].value()}
+        preset = {"model": self._krig_model_combo.currentData()}
+        for n, sl in self._sliders.items():
+            if n == "Range": preset["range"] = sl.value()
+            elif n == "Sill (psill)": preset["psill"] = sl.value()
+            elif n == "Nugget": preset["nugget"] = sl.value()
+            elif n == "Angle (°)": preset["angle_deg"] = sl.value()
+            elif n == "Anisotropy ×": preset["anisotropy_ratio"] = sl.value()
+            elif n == "Alpha": preset["alpha"] = sl.value()
+        return preset
+
+    def _draw_variogram_tabs(self, preset=None):
+        """Redraw all three variogram tabs from the current data + preset.
+        Does NOT start a prediction — safe to call on bare data load."""
+        if preset is None:
+            preset = self._current_preset()
         self._compute_directional()          # recompute dir_cache (n_lags may have changed)
         self._redraw_omnidirectional(preset)
         self._redraw_directional()
         self._redraw_anisotropy_rose(preset)
+
+    def _fire_sliders(self, *_):
+        preset = self._current_preset()
+        self._ctrl._state["kriging_n_lags"] = self._nlags_spin.value()
+        self._ctrl.on_slider_change(preset)   # debounced live preview (genuine interaction)
+        self._draw_variogram_tabs(preset)
+
+    def _on_data_loaded(self):
+        """On bare data load: show the empirical variogram FIRST (not a prediction).
+        The user hasn't fit or run anything yet — draw the variogram tabs and put a
+        neutral placeholder in the prediction/uncertainty panels."""
+        self._draw_variogram_tabs()
+        self._show_prediction_placeholders()
+
+    def _show_prediction_placeholders(self):
+        msg = "Adjust a parameter or click Run / Optimize to predict"
+        for dp_name in ("Prediction Surface", "Uncertainty (std)"):
+            dp = self._plots.get(dp_name)
+            if dp is None:
+                continue
+            fig = dp.canvas.fig; fig.clear(); ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, msg, ha="center", va="center",
+                    transform=ax.transAxes, fontsize=10, color="gray",
+                    wrap=True)
+            ax.set_xticks([]); ax.set_yticks([])
+            dp.canvas.draw_idle()
 
     def _on_result(self, result):
         grid = result.get("grid")
@@ -427,7 +540,11 @@ class GeospatialApp(QMainWindow):
 
     def _redraw_omnidirectional(self, preset):
         import numpy as np
-        from ui.variogram_panel import compute_empirical_variogram, compute_model_curve
+        # Use the SAME empirical variogram the optimizer fits (utils, max_lag = 0.5·max_dist)
+        # — and that the Directional/Rose tabs already use — so the fitted curve overlays the
+        # dots at any n_lags. variogram_panel's median-cutoff version binned differently.
+        from utils import compute_empirical_variogram as _utils_vg
+        from ui.variogram_panel import compute_model_curve
         canvas = self._vario_canvases.get("Omnidirectional")
         if canvas is None or self._ctrl._X is None:
             return
@@ -436,7 +553,9 @@ class GeospatialApp(QMainWindow):
         ax.set_xlabel("Lag distance"); ax.set_ylabel("Semivariance")
         ax.set_title("Empirical Variogram" if is_gp else "Variogram Fit")
         n_lags = self._nlags_spin.value()
-        lags, sv = compute_empirical_variogram(self._ctrl._X, self._ctrl._y, n_lags=n_lags)
+        emp = _utils_vg(self._ctrl._X, self._ctrl._y, n_lags=n_lags)
+        valid = emp["n_pairs"] > 0
+        lags, sv = emp["lags"][valid], emp["semivariance"][valid]
         if len(lags):
             ax.scatter(lags, sv, color="#1f77b4", s=28, zorder=3, label="Empirical")
         if is_gp:
@@ -557,6 +676,32 @@ class GeospatialApp(QMainWindow):
                 self._sliders["Range"].setValue(float(max(ls)))
         # Redraw with new params
         self._fire_sliders()
+
+    # ── progress bar ───────────────────────────────────────────────────
+    def _on_busy_started(self, label: str):
+        # Indeterminate (busy) animation while a long op is in flight.
+        self._progress.setRange(0, 0)
+        self._progress.setFormat(label or "Working…")
+        self._progress.setVisible(True)
+        # Inline preview blocks the main thread; force a paint so the bar shows.
+        QApplication.processEvents()
+
+    def _on_busy_finished(self):
+        self._progress.setVisible(False)
+        self._progress.setRange(0, 100)
+        self._progress.reset()
+
+    def _on_progress(self, percent: int, label: str):
+        # Determinate update parsed from the subprocess stage markers.
+        if percent <= 0 and not label:
+            self._progress.setVisible(False)
+            self._progress.setRange(0, 100)
+            self._progress.reset()
+            return
+        self._progress.setRange(0, 100)
+        self._progress.setValue(int(percent))
+        self._progress.setFormat(f"{label}  ({percent}%)" if label else f"{percent}%")
+        self._progress.setVisible(True)
 
     def _on_metrics(self, m: dict):
         def g(k):
