@@ -12,8 +12,8 @@ from PySide6.QtWidgets import (
     QMainWindow, QApplication, QSplitter, QStatusBar, QLabel,
     QMenuBar, QMenu, QMessageBox, QWidget, QGridLayout, QVBoxLayout,
     QHBoxLayout,
-    QRadioButton, QCheckBox, QComboBox, QPushButton, QButtonGroup,
-    QFileDialog, QDialog, QDialogButtonBox, QSpinBox, QTabWidget,
+    QCheckBox, QComboBox, QPushButton,
+    QFileDialog, QDialog, QDialogButtonBox, QSpinBox, QDoubleSpinBox, QTabWidget,
     QProgressBar, QDockWidget,
 )
 from PySide6.QtCore import Qt, QSettings
@@ -74,41 +74,26 @@ class GeospatialApp(QMainWindow):
             rl.addWidget(QLabel(lbl)); rl.addWidget(cb); dl.addWidget(row)
         eng_w = QWidget(); el = QVBoxLayout(eng_w); el.setContentsMargins(0, 4, 0, 0)
         el.addWidget(QLabel("Engine:"))
-        self._eng_group = QButtonGroup(self)
-        self._radio_krig = QRadioButton("Ordinary Kriging")
-        self._radio_krig.setToolTip(
-            "Classical geostatistical interpolation. Fast, fits a variogram\n"
-            "model to your data, produces a predicted surface + kriging\n"
-            "variance. Good default for most spatial datasets.")
-        self._radio_gp = QRadioButton("Gaussian Process")
-        self._radio_gp.setToolTip(
-            "Probabilistic machine learning approach. Fits a covariance\n"
-            "kernel by maximizing the marginal likelihood. Slower but\n"
-            "produces a full predictive distribution with per-point\n"
-            "uncertainty. Better for small to medium datasets.")
-        self._radio_krig.setChecked(True)
-        self._eng_group.addButton(self._radio_krig, 0)
-        self._eng_group.addButton(self._radio_gp, 1)
-        el.addWidget(self._radio_krig); el.addWidget(self._radio_gp)
+        self._engine_combo = QComboBox()
+        self._engine_combo.addItems(["Ordinary Kriging", "Gaussian Process"])
+        self._engine_combo.setToolTip(
+            "Interpolation method. Ordinary Kriging = classical geostatistics\n"
+            "(fast, fits a variogram model). Gaussian Process = probabilistic\n"
+            "ML approach (slower, full predictive distribution).")
+        el.addWidget(self._engine_combo)
         dl.addWidget(eng_w)
 
         # Grid mode toggle
         grid_mode_w = QWidget(); gml = QVBoxLayout(grid_mode_w)
         gml.setContentsMargins(0, 6, 0, 0)
         gml.addWidget(QLabel("Prediction grid:"))
-        self._grid_mode_group = QButtonGroup(self)
-        self._radio_auto_grid = QRadioButton("Auto (convex hull)")
-        self._radio_custom_pts = QRadioButton("Custom points (CSV)")
-        self._radio_auto_grid.setChecked(True)
-        self._radio_auto_grid.setToolTip(
-            "Generate a regular grid bounded by the buffered convex hull\n"
-            "of your data points. Resolution is set in Engine Options.")
-        self._radio_custom_pts.setToolTip(
-            "Predict at specific X,Y locations from a CSV file.\n"
-            "Useful for predicting at monitoring stations or well locations.")
-        self._grid_mode_group.addButton(self._radio_auto_grid, 0)
-        self._grid_mode_group.addButton(self._radio_custom_pts, 1)
-        gml.addWidget(self._radio_auto_grid); gml.addWidget(self._radio_custom_pts)
+        self._grid_mode_combo = QComboBox()
+        self._grid_mode_combo.addItems(["Auto (convex hull)", "Custom points (CSV)"])
+        self._grid_mode_combo.setToolTip(
+            "Auto = regular grid bounded by the convex hull of your data.\n"
+            "Custom = predict at specific X,Y locations from a CSV file\n"
+            "(e.g., monitoring stations or well locations).")
+        gml.addWidget(self._grid_mode_combo)
 
         # Custom points file picker (hidden until custom mode selected)
         self._custom_pts_picker = FilePicker()
@@ -240,6 +225,55 @@ class GeospatialApp(QMainWindow):
         self._nlags_spin.valueChanged.connect(self._fire_sliders)
         vl.addWidget(self._nlags_label)
         vl.addWidget(self._nlags_spin)
+
+        # Lag distance spinbox = lag separation / bin width (0 = auto)
+        self._max_lag_label = QLabel("Lag distance:")
+        self._max_lag_spin = QDoubleSpinBox()
+        self._max_lag_spin.setRange(0, 99999)
+        self._max_lag_spin.setValue(0)
+        self._max_lag_spin.setDecimals(1)
+        self._max_lag_spin.setSpecialValueText("auto")
+        self._max_lag_spin.setToolTip(
+            "Lag separation — the width of each variogram bin.\n"
+            "Total reach = number of lags × this value.\n"
+            "'auto' (0) derives a good value from your data spacing.")
+        self._max_lag_spin.valueChanged.connect(self._fire_sliders)
+        vl.addWidget(self._max_lag_label)
+        vl.addWidget(self._max_lag_spin)
+
+        # Lag tolerance spinbox = ± window around each lag (0 = auto = half lag distance)
+        self._lag_tol_label = QLabel("Lag tolerance:")
+        self._lag_tol_spin = QDoubleSpinBox()
+        self._lag_tol_spin.setRange(0, 99999)
+        self._lag_tol_spin.setValue(0)
+        self._lag_tol_spin.setDecimals(1)
+        self._lag_tol_spin.setSpecialValueText("auto")
+        self._lag_tol_spin.setToolTip(
+            "± window around each lag center when grouping point pairs.\n"
+            "'auto' (0) uses half the lag distance (contiguous bins).\n"
+            "Larger = overlapping bins (smoother variogram); smaller =\n"
+            "gaps between bins.")
+        self._lag_tol_spin.valueChanged.connect(self._fire_sliders)
+        vl.addWidget(self._lag_tol_label)
+        vl.addWidget(self._lag_tol_spin)
+
+        # Lock checkboxes for lag parameters
+        lock_row = QWidget(); lrl = QHBoxLayout(lock_row); lrl.setContentsMargins(0, 2, 0, 0)
+        self._lock_nlags_cb = QCheckBox("Lock n_lags")
+        self._lock_nlags_cb.setChecked(True)
+        self._lock_nlags_cb.setToolTip(
+            "When locked: 'Optimize Parameters' keeps n_lags at its\n"
+            "current value. When unlocked: the optimizer searches for\n"
+            "the best n_lags (along with unlocked lag distance).")
+        self._lock_lag_cb = QCheckBox("Lock lag distance")
+        self._lock_lag_cb.setChecked(False)
+        self._lock_lag_cb.setToolTip(
+            "When locked: 'Optimize Parameters' keeps lag distance at\n"
+            "its current value. When unlocked: the optimizer searches for\n"
+            "the best lag distance (along with unlocked n_lags).")
+        lrl.addWidget(self._lock_nlags_cb); lrl.addWidget(self._lock_lag_cb)
+        vl.addWidget(lock_row)
+
         self._sliders = {}
         _slider_tooltips = {
             "Range": "The distance at which the variogram levels off.\n"
@@ -513,7 +547,7 @@ class GeospatialApp(QMainWindow):
         self._file_picker.fileSelected.connect(self._on_file_selected)
         for cb in (self._col_x, self._col_y, self._col_z):
             cb.currentTextChanged.connect(lambda: self._try_load())
-        self._eng_group.buttonToggled.connect(self._on_engine_changed)
+        self._engine_combo.currentIndexChanged.connect(self._on_engine_changed)
         self._krig_model_combo.currentTextChanged.connect(self._fire_sliders)
         self._gp_kernel_combo.currentTextChanged.connect(self._fire_sliders)
         for sl in self._sliders.values():
@@ -528,7 +562,9 @@ class GeospatialApp(QMainWindow):
         self._detrend_order_cb.currentIndexChanged.connect(self._on_preproc_changed)
         self._detrend_auto_cb.toggled.connect(self._on_preproc_changed)
         self._nst_combo.currentIndexChanged.connect(self._on_preproc_changed)
-        self._grid_mode_group.buttonToggled.connect(self._on_grid_mode_changed)
+        self._lock_nlags_cb.toggled.connect(self._on_lag_lock_changed)
+        self._lock_lag_cb.toggled.connect(self._on_lag_lock_changed)
+        self._grid_mode_combo.currentIndexChanged.connect(self._on_grid_mode_changed)
         self._custom_pts_picker.fileSelected.connect(self._on_custom_pts_file)
         self._custom_pts_col_x.currentTextChanged.connect(
             lambda: self._on_custom_pts_cols_changed())
@@ -568,16 +604,20 @@ class GeospatialApp(QMainWindow):
             self._ctrl.load_data(fp, cx, cy, cz)
             self._sidebar.expandSection(2)  # Variogram Controls (now section index 2)
 
-    def _on_engine_changed(self, btn, checked):
-        if not checked:
-            return
-        mode = "gp" if btn is self._radio_gp else "kriging"
+    def _on_engine_changed(self, idx):
+        mode = "gp" if idx == 1 else "kriging"
         self._ctrl.set_engine(mode)
         is_krig = mode == "kriging"
         self._krig_model_label.setVisible(is_krig)
         self._krig_model_combo.setVisible(is_krig)
         self._nlags_label.setVisible(is_krig)
         self._nlags_spin.setVisible(is_krig)
+        self._max_lag_label.setVisible(is_krig)
+        self._max_lag_spin.setVisible(is_krig)
+        self._lag_tol_label.setVisible(is_krig)
+        self._lag_tol_spin.setVisible(is_krig)
+        self._lock_nlags_cb.setVisible(is_krig)
+        self._lock_lag_cb.setVisible(is_krig)
         self._gp_kernel_label.setVisible(not is_krig)
         self._gp_kernel_combo.setVisible(not is_krig)
         self._gp_notice.setVisible(not is_krig)
@@ -594,10 +634,12 @@ class GeospatialApp(QMainWindow):
         self._ctrl.set_preprocessing(detrend_enabled, detrend_order,
                                      detrend_auto, nst_enabled)
 
-    def _on_grid_mode_changed(self, btn, checked):
-        if not checked:
-            return
-        use_custom = btn is self._radio_custom_pts
+    def _on_lag_lock_changed(self, *_):
+        self._ctrl._state["kriging_lock_n_lags"] = self._lock_nlags_cb.isChecked()
+        self._ctrl._state["kriging_lock_max_lag"] = self._lock_lag_cb.isChecked()
+
+    def _on_grid_mode_changed(self, idx):
+        use_custom = idx == 1
         self._custom_pts_picker.setVisible(use_custom)
         self._custom_pts_col_x_label.setVisible(use_custom)
         self._custom_pts_col_x.setVisible(use_custom)
@@ -649,9 +691,9 @@ class GeospatialApp(QMainWindow):
 
         # Apply engine mode
         if updates.get("engine_mode") == "gp":
-            self._radio_gp.setChecked(True)
+            self._engine_combo.setCurrentIndex(1)
         else:
-            self._radio_krig.setChecked(True)
+            self._engine_combo.setCurrentIndex(0)
 
         # Apply preprocessing controls
         self._detrend_cb.setChecked(updates.get("detrend_enabled", False))
@@ -672,9 +714,13 @@ class GeospatialApp(QMainWindow):
                     self._gp_kernel_combo.setCurrentIndex(i)
                     break
 
-        # Apply n_lags
+        # Apply n_lags + GSLIB lag binning (lag distance / tolerance)
         if "n_lags" in updates:
             self._nlags_spin.setValue(updates["n_lags"])
+        if "lag_width" in updates:
+            self._max_lag_spin.setValue(float(updates["lag_width"] or 0.0))
+        if "lag_tolerance" in updates:
+            self._lag_tol_spin.setValue(float(updates["lag_tolerance"] or 0.0))
 
         # Apply compute-CV toggle
         self._cv_cb.setChecked(bool(updates.get("compute_cv", False)))
@@ -760,6 +806,8 @@ class GeospatialApp(QMainWindow):
     def _fire_sliders(self, *_):
         preset = self._current_preset()
         self._ctrl._state["kriging_n_lags"] = self._nlags_spin.value()
+        self._ctrl._state["kriging_lag_width"] = self._max_lag_spin.value()
+        self._ctrl._state["kriging_lag_tol"] = self._lag_tol_spin.value()
         self._ctrl.on_slider_change(preset)   # debounced live preview (genuine interaction)
         self._draw_variogram_tabs(preset)
 
@@ -864,6 +912,16 @@ class GeospatialApp(QMainWindow):
         dp.canvas.draw_idle()
 
     # ── variogram tabs ─────────────────────────────────────────────────
+    def _lag_binning(self):
+        """Current GSLIB-style lag params from the sidebar (0 spinbox = auto/None)."""
+        lw = self._max_lag_spin.value()
+        lt = self._lag_tol_spin.value()
+        return {
+            "n_lags": self._nlags_spin.value(),
+            "lag_width": lw if lw > 0 else None,
+            "lag_tolerance": lt if lt > 0 else None,
+        }
+
     def _compute_directional(self):
         """Compute 12 directional empirical variograms (15° intervals) and cache."""
         if self._ctrl._X is None:
@@ -871,11 +929,10 @@ class GeospatialApp(QMainWindow):
             return
         from utils import compute_empirical_variogram as utils_variogram
         directions = list(range(0, 180, 15))  # 0, 15, …, 165
-        n_lags = self._nlags_spin.value()
         try:
             self._dir_cache = utils_variogram(
                 self._ctrl._X, self._ctrl._y,
-                n_lags=n_lags, directions=directions)
+                directions=directions, **self._lag_binning())
         except Exception:
             self._dir_cache = None
 
@@ -893,8 +950,7 @@ class GeospatialApp(QMainWindow):
         fig = canvas.fig; fig.clear(); ax = fig.add_subplot(111)
         ax.set_xlabel("Lag distance"); ax.set_ylabel("Semivariance")
         ax.set_title("Empirical Variogram" if is_gp else "Variogram Fit")
-        n_lags = self._nlags_spin.value()
-        emp = _utils_vg(self._ctrl._X, self._ctrl._y, n_lags=n_lags)
+        emp = _utils_vg(self._ctrl._X, self._ctrl._y, **self._lag_binning())
         valid = emp["n_pairs"] > 0
         lags, sv = emp["lags"][valid], emp["semivariance"][valid]
         if len(lags):
@@ -925,13 +981,26 @@ class GeospatialApp(QMainWindow):
             ax.set_title("Directional Variograms (load data first)", fontsize=10)
             canvas.draw_idle()
             return
+
+        # Directional variograms (faded)
         cmap = plt.cm.tab20
         n = len(self._dir_cache)
         for i, dv in enumerate(self._dir_cache):
             valid = dv["n_pairs"] > 0
             ax.plot(dv["lags"][valid], dv["semivariance"][valid], "o-",
                     color=cmap(i / max(n, 1)), ms=4, lw=1.2,
-                    label=f"{dv['direction']:.0f}°")
+                    alpha=0.75, label=f"{dv['direction']:.0f}°")
+
+        # Omnidirectional variogram (prominent overlay — black diamonds)
+        from utils import compute_empirical_variogram as _utils_vg
+        n_lags = self._nlags_spin.value()
+        omni = _utils_vg(self._ctrl._X, self._ctrl._y, n_lags=n_lags)
+        om_valid = omni["n_pairs"] > 0
+        if om_valid.any():
+            ax.plot(omni["lags"][om_valid], omni["semivariance"][om_valid],
+                    "D-", color="black", ms=6, lw=1.5, alpha=1.0,
+                    label="Omnidirectional", zorder=10)
+
         ax.set_xlabel("Lag distance", fontsize=9)
         ax.set_ylabel("Semivariance", fontsize=9)
         ax.set_title("Directional Variograms (15° intervals)", fontsize=10)
@@ -1004,6 +1073,15 @@ class GeospatialApp(QMainWindow):
                 min(float(params["anisotropy_ratio"]), 15.0))
         if "alpha" in params:
             self._sliders["Alpha"].setValue(float(params["alpha"]))
+        # Surface the lag binning the optimizer chose (kriging only). Block signals so
+        # the trailing _fire_sliders() does a single redraw instead of three.
+        for spin, key, cast in ((self._nlags_spin, "n_lags", int),
+                                (self._max_lag_spin, "lag_width", float),
+                                (self._lag_tol_spin, "lag_tolerance", float)):
+            if key in params:
+                spin.blockSignals(True)
+                spin.setValue(cast(params[key]))
+                spin.blockSignals(False)
         # GP params
         if "kernel_type" in params:
             kt = params["kernel_type"]

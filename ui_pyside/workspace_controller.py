@@ -63,7 +63,13 @@ class WorkspaceController(QObject):
                        "nst_enabled": False,
                        # Cross-validation is O(N^3) and OFF by default. The CV
                        # checkbox governs only the full "Run Interpolation" path.
-                       "compute_cv": False}
+                       "compute_cv": False,
+                       # GSLIB-style lag binning controls (Kriging only); 0 = auto
+                       "kriging_lag_width": 0.0,       # lag distance = bin width
+                       "kriging_lag_tol": 0.0,         # lag tolerance (± window)
+                       "kriging_lock_n_lags": True,    # keep n_lags fixed
+                       "kriging_lock_max_lag": False,  # search lag distance
+                       }
 
         # Debounce timer for live preview (single-shot, 300ms)
         self._debounce = QTimer(self)
@@ -430,11 +436,18 @@ class WorkspaceController(QObject):
         compute_cv = bool(self._state.get("compute_cv", False))
         if self._engine == "kriging":
             n_lags = int(self._state.get("kriging_n_lags", 12))
-            cfg["engine"]["kriging"] = {
+            lag_width = float(self._state.get("kriging_lag_width", 0.0))
+            lag_tol = float(self._state.get("kriging_lag_tol", 0.0))
+            kcfg: dict = {
                 "n_lags": n_lags,
+                "lag_width": lag_width,
+                "lag_tolerance": lag_tol,
+                "lock_n_lags": bool(self._state.get("kriging_lock_n_lags", True)),
+                "lock_max_lag": bool(self._state.get("kriging_lock_max_lag", False)),
                 "preset_params": preset.copy(),
                 "compute_cv": compute_cv,
             }
+            cfg["engine"]["kriging"] = kcfg
         else:
             cfg["engine"]["gp"] = {
                 "preset_params": preset.copy(),
@@ -477,6 +490,13 @@ class WorkspaceController(QObject):
             preset = kc.get("preset_params", {})
             updates["kriging_model"] = preset.get("model", "spherical")
             updates["n_lags"] = kc.get("n_lags", 12)
+            updates["lag_width"] = float(kc.get("lag_width", 0.0))
+            updates["lag_tolerance"] = float(kc.get("lag_tolerance", 0.0))
+            updates["lock_n_lags"] = bool(kc.get("lock_n_lags", True))
+            updates["lock_max_lag"] = bool(kc.get("lock_max_lag", False))
+            # Keep state in sync so a subsequent Run/preview uses loaded binning
+            self._state["kriging_lag_width"] = updates["lag_width"]
+            self._state["kriging_lag_tol"] = updates["lag_tolerance"]
             updates["sliders"] = {
                 "Range": preset.get("range", 300.0),
                 "Sill (psill)": preset.get("psill", 5.0),

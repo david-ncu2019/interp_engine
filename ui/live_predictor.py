@@ -64,15 +64,16 @@ def compute_preview(engine: str, X: np.ndarray, y: np.ndarray,
         from src.engines.gp import RotatedGPR
         model = RotatedGPR()
         model.fit_with_known_params(coords, y, preset)
+        mean, std = model.predict(pts, return_std=True)
     else:
-        from src.engines.kriging import AnisotropicKriging
-        model = AnisotropicKriging()
-        model.fit_with_known_params(
-            coords, y,
+        # Direct lu_solve kriging — ~3-4x faster than going through PyKrige
+        # via AnisotropicKriging.predict, and the slider-drag UX hinges on it.
+        from src.engines.fast_kriging import ok_predict
+        kparams = _kriging_params_from_preset(preset)
+        mean, std = ok_predict(
+            coords, y, pts,
             preset.get("model", "spherical"),
-            _kriging_params_from_preset(preset))
-
-    mean, std = model.predict(pts, return_std=True)
+            kparams, return_std=True)
     mean = np.asarray(mean, float).copy()
     std = np.asarray(std, float).copy()
     mean[~mask] = np.nan        # blank outside the buffered hull

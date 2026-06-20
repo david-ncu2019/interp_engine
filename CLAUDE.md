@@ -66,9 +66,11 @@ GP has a similar preset vs Optuna split.
 
 - **`src/engines/gp.py`** — `RotatedGPR(BaseEstimator, RegressorMixin)`. Coarse angle scan → Optuna TPE → L-BFGS-B polish. Supports Matern-3/2, Matern-5/2, RBF kernels with anisotropic rotation.
 
+- **`src/engines/fast_kriging.py`** — `ok_predict(X_tr, y_tr, X_te, model_name, params)`. Stand-alone NumPy/`np.linalg.solve` ordinary-kriging predictor; byte-equivalent to PyKrige's `OrdinaryKriging.execute('points', …)` (verified to 1e-11 across spherical/exponential/gaussian/matern_32/stable, isotropic and anisotropic). Used by `_quick_cv_rmss` (search-loop CV) and `ui/live_predictor.compute_preview` (slider-drag live preview) — 20× faster than going through PyKrige for these hot paths. Final-Run prediction still uses PyKrige via `_get_ok_instance`.
+
 ### Utilities
 
-- **`utils.py`** (project root, not in `src/`): empirical variogram computation (`compute_empirical_variogram` — supports directional mode via `directions` parameter), spatial block folds (`make_spatial_block_folds`), adaptive lag parameters (`auto_lag_params`), all diagnostic plot functions. Imported by both engines and main.py.
+- **`utils.py`** (project root, not in `src/`): empirical variogram computation (`compute_empirical_variogram` — GSLIB-style binning: `n_lags` + `lag_width` (separation) + `lag_tolerance` (± window). Centers sit at `lag_width*(k+0.5)`; default `lag_tolerance = lag_width/2` reproduces classic contiguous edges. Supports directional mode (`directions=` list) and reuse of precomputed pairwise data via `_dists`/`_diff_sq` kwargs. When BOTH `n_lags` and `lag_width` are passed, the GSLIB branch fires and `max_lag = n_lags × lag_width` overrides any caller-supplied `max_lag`), spatial block folds (`make_spatial_block_folds`), adaptive lag parameters (`auto_lag_params`), all diagnostic plot functions. Imported by both engines and main.py.
 
 - **`src/preprocessor.py`**: `TrendProcessor` (polynomial detrending with F-test auto-detection), `NormalScoreTransform` (rank-based Gaussian transform). Uses statsmodels, libpysal/esda for Moran's I.
 
@@ -100,7 +102,7 @@ GP has a similar preset vs Optuna split.
 
 ### Config flow
 
-UI state dict → `build_config()` (engine_runner.py) → temp YAML → `main.py` reads YAML → pipeline. The config keys `kriging.model` and `kriging.preset_params` control the three-way fit dispatch. `kriging.n_lags` sets the variogram bin count.
+UI state dict → `build_config()` (engine_runner.py) → temp YAML → `main.py` reads YAML → pipeline. The config keys `kriging.model` and `kriging.preset_params` control the three-way fit dispatch. Kriging binning controls: `kriging.n_lags`, `kriging.lag_width`, `kriging.lag_tolerance` (0 = auto in UI / None in engine), and `kriging.lock_n_lags`, `kriging.lock_max_lag` (locks gate the Optimize-time search; default `True` and `False` respectively).
 
 ## Test data
 
@@ -108,9 +110,10 @@ UI state dict → `build_config()` (engine_runner.py) → temp YAML → `main.py
 
 ## Performance considerations
 
-- `fit_deterministic()` uses a fast 3-stage pipeline: WLS-only DE optimization on 3D/4D (no CV in the loop), directional anisotropy estimation from 4 directional variograms, and a single 5-fold CV at the end. Completes in <1s for 500 points.
+- `fit_deterministic()` uses a 4-stage pipeline: optional lag-parameter search (only when `lock_n_lags=False` or `lock_max_lag=False`), Stage-1 empirical variogram, Stage-2 WLS multi-start `least_squares`, Stage-3 directional anisotropy from 4 directional variograms, Stage-4 optional CV (`compute_cv=True`, off by default). Completes in ~0.8–1.1 s on 500 points across all 11 models (was ~2.1 s before fast_kriging). Stage-2 bounds `psill` and `range` by what the empirical variogram can support (`psill_upper = max(data_var, max(emp_sv))*2`, `range_upper = min(max_dist*1.5, emp_lags[-1]*1.5)`) — prevents the Cressie-weighting degenerate-basin pathology when the user binning truncates the variogram below the structural range.
 - The legacy `fit()` Optuna path runs CV inside every trial and is much slower — it exists for backward compatibility.
-- PyKrige `OrdinaryKriging` solves O(N^3) per prediction call. Keep N reasonable (<5000 points) or expect long prediction times.
+- Live preview (`ui/live_predictor.compute_preview`, 40-cell grid, N=500): ~75 ms, down from ~1.5 s by routing through `fast_kriging.ok_predict` instead of `AnisotropicKriging.predict` → PyKrige.
+- PyKrige `OrdinaryKriging` solves O(N^3) per prediction call and is still used for the final Run (large-grid prediction). Keep N reasonable (<5000 points) or expect long prediction times.
 - Windows stdout encoding: main.py reconfigures stdout to UTF-8 at startup. engine_runner.py passes `PYTHONIOENCODING=utf-8` to subprocesses. This prevents UnicodeEncodeError from matplotlib/Unicode print statements in piped mode.
 
 ## Pitfalls
@@ -119,3 +122,6 @@ UI state dict → `build_config()` (engine_runner.py) → temp YAML → `main.py
 - Both `KrigingPanel` and `GPPanel` in variogram_panel.py have similar `__init__` signatures. When editing one, include enough context (class name / docstring) to disambiguate.
 - `utils.py` lives at project root, not in `src/`. Engine files import it with `from utils import ...` inside methods to avoid circular imports at module load time.
 - Windows DLL contamination: if a conda env with MKL/Intel OpenMP (e.g. `gemini_env`) is on PATH when `fafalab2` Python starts, numpy/scipy crash with `0xc06d007f`. `ui_pyside/__init__.py` purges bad PATH entries before Qt import. For subprocess runs via QProcess the PATH is inherited clean from `conda run`. For dev/debug outside `conda run`, set `KMP_DUPLICATE_LIB_OK=TRUE` as a temporary workaround.
+- **PyKrige's native variogram parameterization differs from ours.** PyKrige's `_make_variogram_parameter_list` treats the user-supplied `psill` as TOTAL sill and internally uses partial sill = `psill − nugget`. Its native `exponential` uses *effective* range and divides by 3 internally; `gaussian` uses `range·4/7`. Our `_eval_*` functions in `kriging.py` use partial sill + mathematical range directly. `fast_kriging._eval_gamma` mirrors PyKrige's conventions by dispatching to PyKrige's native funcs for native models (and our `VARIOGRAM_EVALUATORS` for custom models). When passing fitted params from our WLS path into PyKrige (in `_get_ok_instance`), the same convention conversion happens implicitly — be aware when comparing variogram curves.
+- **Use `np.linalg.solve`, NOT `scipy.linalg.lu_factor` or `scipy.linalg.lapack.dgesv` for the kriging system.** On the bordered indefinite OK matrix in scipy 1.17, both scipy wrappers exhibit a progressive per-call slowdown (~22 ms first call → ~1700 ms by call 7) — pure memory-pollution pattern. `np.linalg.solve` stays flat at ~8 ms across thousands of calls. Same LAPACK underneath; only the wrappers differ. `fast_kriging.ok_predict` uses `np.linalg.solve` for this reason.
+- **Stage-1 in `fit_deterministic` must gate `lag_width`/`lag_tolerance` on `lock_max_lag`.** When `lock_max_lag=False` the search loop picks `best_ml`; if the caller's stale `lag_width` is then passed to Stage-1, `compute_empirical_variogram`'s GSLIB branch silently overrides `max_lag` with `n_lags × stale_lag_width`, discarding the search result. The gate is: `lag_width=lag_width if lock_max_lag else None` (and same for `lag_tolerance`).
