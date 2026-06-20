@@ -275,25 +275,36 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         y: np.ndarray,
         model_name: str,
         n_lags: int = 12,
+        max_lag: Optional[float] = None,
+        lag_width: Optional[float] = None,
+        lag_tolerance: Optional[float] = None,
         n_folds: int = 5,
         wls_weight: float = 0.4,
-        cv_weight: float = 0.4,
-        sspe_weight: float = 0.2,
+        cv_weight: float = 0.2,
+        sspe_weight: float = 0.4,
+        lock_n_lags: bool = True,
+        lock_max_lag: bool = True,
         compute_cv: bool = False,
     ) -> 'AnisotropicKriging':
-        """Fast deterministic variogram optimizer — fit the model to the empirical
-        variogram given a user-chosen number of lags.
+        """Fast deterministic variogram optimizer with lag-parameter search.
 
         Stage 1: Data-driven initial estimates from empirical variogram.
         Stage 2: WLS fit via multi-start least_squares (psill, range, nugget, [alpha]).
         Stage 3: Directional anisotropy from 4 directional variograms.
         Stage 4: Optional CV for quality reporting (off by default), final model build.
 
+        When lock_n_lags or lock_max_lag is False, runs an outer search over the
+        unlocked lag parameter(s) using a composite objective that balances
+        variogram fit (WLS) against uncertainty calibration (|RMSS - 1|).
+
+        max_lag=None means auto (0.5 * max_pairwise_distance).
+
         Performance:
           - The empirical variogram is estimated from at most VARIO_MAX_POINTS
             (deterministic subsample) so the O(N^2) cost stays bounded for large N.
           - Stage-4 CV (the only O(N^3) work) is skipped unless compute_cv=True.
-        Target: <2 seconds. Fully deterministic: same data + model → same result.
+        Target: <2 seconds with locks; ~5-15s with lag search. Fully deterministic:
+        same data + model → same result.
         """
         import time as _time
         from utils import compute_empirical_variogram, make_spatial_block_folds
@@ -315,18 +326,120 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
             sub = rng.choice(len(X), size=VARIO_MAX_POINTS, replace=False)
             sub.sort()
             X_emp, y_emp = X[sub], y[sub]
-            print(f"       [fast-opt] Model: {model_name}, n_lags: {n_lags}, N={len(y)} "
-                  f"(variogram from {VARIO_MAX_POINTS}-pt subsample)", flush=True)
         else:
             X_emp, y_emp = X, y
-            print(f"       [fast-opt] Model: {model_name}, n_lags: {n_lags}, "
-                  f"N={len(y)}", flush=True)
+        max_lag_str = f", max_lag={max_lag:.1f}" if max_lag else ""
+        nl_str = f"{n_lags}{max_lag_str}"
+        print(f"       [fast-opt] Model: {model_name}, n_lags: {nl_str}, "
+              f"N={len(y)}"
+              + (f" (variogram from {VARIO_MAX_POINTS}-pt subsample)"
+                 if len(X) > VARIO_MAX_POINTS else ""),
+              flush=True)
+
+        # Precompute the N×N pairwise data ONCE — reused by every empirical-
+        # variogram call during the lag search + Stage-1 + Stage-3 (directional).
+        from scipy.spatial.distance import pdist, squareform
+        _dists_cache = squareform(pdist(X_emp))
+        _diff_sq_cache = np.subtract.outer(y_emp, y_emp) ** 2
+
+        # ── Lag parameter search (when unlocked) ────────────────────────────
+        if not lock_n_lags or not lock_max_lag:
+            from utils import make_spatial_block_folds as _msbf
+
+            # Candidate grid
+            nl_candidates = [6, 8, 10, 12, 15, 20, 25, 30, 40] if not lock_n_lags else [n_lags]
+            max_lag_auto = 0.5 * max_dist
+            if not lock_max_lag:
+                ml_candidates = np.linspace(
+                    max_lag_auto * 0.3, max_lag_auto * 1.5, 8)
+            else:
+                ml_candidates = [max_lag_auto if max_lag is None else max_lag]
+
+            best_score = float('inf')
+            best_nl, best_ml = n_lags, (max_lag_auto if max_lag is None else max_lag)
+            fold_ids = _msbf(X, n_folds) if n_folds > 1 else np.zeros(len(X), dtype=int)
+
+            print(f"       [fast-opt] Searching lag params: "
+                  f"n_lags={'unlocked' if not lock_n_lags else 'locked='+str(n_lags)}, "
+                  f"max_lag={'unlocked' if not lock_max_lag else 'locked'}",
+                  flush=True)
+
+            for nl in nl_candidates:
+                for ml in ml_candidates:
+                    ml_val = float(ml)
+                    # Compute empirical variogram with candidate params
+                    emp_c = compute_empirical_variogram(
+                        X_emp, y_emp, n_lags=int(nl),
+                        max_lag=ml_val if not lock_max_lag else None,
+                        lag_width=lag_width if lock_max_lag else None,
+                        lag_tolerance=lag_tolerance,
+                        _dists=_dists_cache, _diff_sq=_diff_sq_cache)
+                    lags_c = emp_c['lags']
+                    sv_c = emp_c['semivariance']
+                    npairs_c = emp_c['n_pairs']
+                    vld = npairs_c > 0
+                    if vld.sum() < 3:
+                        continue
+
+                    # WLS fit
+                    try:
+                        wls_res = self._fit_wls_inner(
+                            lags_c[vld], sv_c[vld], npairs_c[vld],
+                            model_name, data_var, max_dist)
+                        if wls_res is None:
+                            continue
+                    except Exception:
+                        continue
+
+                    # Quick inline CV — compute RMSS
+                    rmss_val = self._quick_cv_rmss(
+                        X, y, model_name, wls_res, fold_ids, n_folds)
+                    if rmss_val is None:
+                        continue
+
+                    # Composite score
+                    wls_err = wls_res.get('cost_norm', 1.0)
+                    sspe_err = abs(rmss_val - 1.0)
+                    score = wls_weight * wls_err + sspe_weight * sspe_err
+
+                    if score < best_score:
+                        best_score = score
+                        best_nl = int(nl)
+                        best_ml = ml_val
+                        best_wls = wls_res
+
+            n_lags = best_nl
+            if not lock_max_lag:
+                max_lag = best_ml
+            print(f"       [fast-opt] Lag search done: n_lags={best_nl}, "
+                  f"max_lag={best_ml:.1f}, score={best_score:.4f}", flush=True)
 
         # ── Stage 1: Empirical variogram + initial estimates ─────────────────
-        emp = compute_empirical_variogram(X_emp, y_emp, n_lags=n_lags)
+        # When lag distance is unlocked the search has chosen max_lag; do NOT also pass
+        # the stale caller lag_width / lag_tolerance, or utils' GSLIB branch overrides
+        # max_lag back to (n_lags × stale_lag_width). Mirrors the lock_max_lag gating
+        # the search loop already uses for these same args.
+        emp = compute_empirical_variogram(
+            X_emp, y_emp,
+            n_lags=n_lags,
+            max_lag=max_lag if max_lag else None,
+            lag_width=lag_width if lock_max_lag else None,
+            lag_tolerance=lag_tolerance if lock_max_lag else None,
+            _dists=_dists_cache, _diff_sq=_diff_sq_cache,
+        )
         emp_lags = emp['lags']
         emp_sv = emp['semivariance']
         emp_npairs = emp['n_pairs']
+
+        # Persist the binning actually used (searched / manual / auto) so it can be
+        # surfaced back to the UI instead of leaving the controls reading "auto".
+        self.n_lags = int(n_lags)
+        self.lag_width_ = float(emp.get('lag_width'))
+        self.max_lag_ = float(emp.get('max_lag'))
+        self.lag_tolerance_ = float(emp.get('lag_tolerance'))
+        print(f"       [fast-opt] Lag binning used: n_lags={self.n_lags}, "
+              f"lag_distance={self.lag_width_:.1f}, tolerance={self.lag_tolerance_:.1f}",
+              flush=True)
 
         valid = emp_npairs > 0
         emp_lags = emp_lags[valid]
@@ -350,10 +463,16 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         has_alpha = model_name in HAS_ALPHA
         use_cressie = model_name not in _UNBOUNDED_MODELS
 
+        # Bound the search by what the empirical variogram can actually support:
+        # range can't exceed the observable window; psill can't exceed the observed
+        # max. This kills the Cressie-weighting degenerate basin where range ≫
+        # max(lag) "buys" tiny residuals at the origin via 1/γ² weighting.
+        range_upper = min(max_dist * 1.5, float(emp_lags[-1]) * 1.5)
+        psill_upper = max(float(data_var), float(np.max(emp_sv))) * 2.0
         bounds_wls = [
-            (data_var * 0.01, data_var * 5.0),    # psill
-            (max_dist * 0.02, max_dist * 1.5),    # range
-            (0.0,             data_var * 1.0),     # nugget
+            (data_var * 0.01, psill_upper),       # psill
+            (max_dist * 0.02, range_upper),       # range
+            (0.0,             data_var * 1.0),    # nugget
         ]
         if has_alpha:
             bounds_wls.append((0.1, 2.0))          # alpha
@@ -446,7 +565,8 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
             t3 = _time.perf_counter()
 
             dir_result = compute_empirical_variogram(
-                X_emp, y_emp, n_lags=n_lags, directions=[0, 45, 90, 135]
+                X_emp, y_emp, n_lags=n_lags, directions=[0, 45, 90, 135],
+                _dists=_dists_cache, _diff_sq=_diff_sq_cache,
             )
 
             dir_ranges = {}
@@ -593,6 +713,149 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         return self
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Helpers for lag-parameter search (used by fit_deterministic)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _fit_wls_inner(self, lags, sv, npairs, model_name, data_var, max_dist):
+        """Core WLS fit for a single (n_lags, max_lag) candidate.
+        Returns dict with fitted params and normalized cost, or None on failure."""
+        import warnings
+        from scipy.optimize import least_squares, differential_evolution
+
+        model_fn = VARIOGRAM_EVALUATORS.get(model_name)
+        if model_fn is None:
+            return None
+        has_alpha = model_name in HAS_ALPHA
+
+        def _gamma(params_vec):
+            # Match the evaluator's signature: 9 of 11 evaluators take 4 args (no alpha);
+            # 2 (stable, rational-quadratic) take alpha as a 5th. Vectorized — every
+            # evaluator already accepts array lags.
+            if has_alpha:
+                psill, range_, nug, alpha = params_vec
+                return model_fn(lags, psill, range_, nug, alpha)
+            psill, range_, nug = params_vec
+            return model_fn(lags, psill, range_, nug)
+
+        use_cressie = model_name not in ("linear", "power")
+
+        # Initial estimates
+        init_nug = float(np.interp(0, lags[:2], sv[:2])) if len(lags) >= 2 else 0.0
+        init_nug = max(0.0, min(init_nug, data_var * 0.5))
+        init_psill = max(float(np.mean(sv[-3:])) if len(sv) >= 3 else data_var,
+                         data_var * 0.1) - init_nug
+        init_psill = max(init_psill, data_var * 0.1)
+        init_range = float(lags[-1] * 0.5)
+        # Match Stage-2 bounds: range/psill capped by the observable window.
+        range_upper = min(max_dist * 1.5, float(lags[-1]) * 1.5)
+        psill_upper = max(float(data_var), float(np.max(sv))) * 2.0
+        bounds_list = [(1e-6, psill_upper), (1.0, range_upper),
+                       (1e-12, data_var * 2.0)]
+        x0_list = [init_psill, init_range, init_nug]
+        if has_alpha:
+            bounds_list.append((0.1, 3.0))
+            x0_list.append(1.0)
+
+        def _wls_obj(p):
+            g = _gamma(p)
+            if use_cressie:
+                w = npairs / np.maximum(g, 1e-12) ** 2
+            else:
+                w = npairs.astype(float)
+            return float(np.sum(w * (sv - g) ** 2))
+
+        best_cost = float('inf')
+        best_params = None
+
+        # Multi-start L-BFGS-B
+        starts = [
+            x0_list,
+            [init_psill * 1.5, init_range * 0.7, init_nug * 2.0]
+            + ([1.0] if has_alpha else []),
+            [init_psill * 0.5, init_range * 1.3, init_nug * 0.5]
+            + ([2.0] if has_alpha else []),
+            [data_var, max_dist * 0.3, 0.0] + ([1.0] if has_alpha else []),
+        ]
+        for x0 in starts:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    res = least_squares(
+                        lambda p: np.sqrt(npairs) * (sv - _gamma(p)),
+                        x0, bounds=list(zip(*bounds_list)),
+                        method='trf', max_nfev=200)
+                cost = _wls_obj(res.x)
+                if cost < best_cost:
+                    best_cost = cost
+                    best_params = res.x.copy()
+            except Exception:
+                continue
+
+        if best_params is None:
+            # Fallback to DE
+            try:
+                res = differential_evolution(
+                    _wls_obj, bounds_list, seed=0, maxiter=100, polish=False)
+                best_cost = _wls_obj(res.x)
+                best_params = res.x
+            except Exception:
+                return None
+
+        result = {
+            'psill': float(best_params[0]),
+            'range': float(best_params[1]),
+            'nugget': float(best_params[2]),
+            'cost': float(best_cost),
+            'cost_norm': float(best_cost) / max(float(np.sum(sv ** 2)), 1e-12),
+        }
+        if has_alpha and len(best_params) >= 4:
+            result['alpha'] = float(best_params[3])
+        return result
+
+    def _quick_cv_rmss(self, X, y, model_name, wls_params, fold_ids, n_folds):
+        """Quick inline CV to compute RMSS for a candidate fit.
+        Returns RMSS or None on failure.
+
+        Uses fast_kriging.ok_predict (lu_factor + batched lu_solve) instead of
+        PyKrige's `inv`-per-fold path. ~3-4x faster, byte-equivalent results.
+        """
+        try:
+            psill = wls_params['psill']
+            range_ = wls_params['range']
+            nugget = wls_params['nugget']
+            alpha = wls_params.get('alpha', 1.0)
+        except KeyError:
+            return None
+
+        from src.engines.fast_kriging import ok_predict
+
+        # Quick CV runs during the lag search before Stage 3 has fitted anisotropy,
+        # so the predictor is isotropic. alpha is only consumed for stable/r-quad.
+        params = {'psill': psill, 'range': range_, 'nugget': nugget,
+                  'angle': 0.0, 'scaling': 1.0, 'alpha': alpha}
+
+        z_scores = []
+        for fold in range(n_folds):
+            tr_idx = np.where(fold_ids != fold)[0]
+            te_idx = np.where(fold_ids == fold)[0]
+            if len(tr_idx) < 10 or len(te_idx) < 3:
+                continue
+            try:
+                mean, std = ok_predict(
+                    X[tr_idx], y[tr_idx], X[te_idx],
+                    model_name, params, return_std=True)
+                resid = y[te_idx] - mean
+                z_sq = (resid / np.maximum(std, 1e-10)) ** 2
+                z_scores.extend(z_sq.tolist())
+            except Exception:
+                continue
+
+        if not z_scores:
+            return None
+        mean_sspe = float(np.mean(z_scores))
+        return float(np.sqrt(mean_sspe))
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Legacy Optuna-based optimizer (backward compatibility)
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -717,4 +980,11 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         }
         if 'alpha' in self.best_params_:
             params['alpha'] = float(self.best_params_['alpha'])
+        # Report the lag binning actually used by the deterministic optimizer so the
+        # UI can show concrete values instead of "auto". Guarded: the preset/Run path
+        # (fit_with_known_params) never sets these, leaving the dict unchanged.
+        if getattr(self, 'lag_width_', None) is not None:
+            params['n_lags'] = int(self.n_lags)
+            params['lag_width'] = float(self.lag_width_)
+            params['lag_tolerance'] = float(self.lag_tolerance_)
         return params

@@ -105,16 +105,28 @@ def auto_lag_params(X, min_pairs_per_bin=30, min_lags=6, max_lags=30):
 
 
 def compute_empirical_variogram(X, y, n_lags=None, max_lag=None,
-                                lag_width=None, max_lag_frac=None,
-                                directions=None, tol_angle=22.5):
+                                lag_width=None, lag_tolerance=None,
+                                max_lag_frac=None,
+                                directions=None, tol_angle=22.5,
+                                _dists=None, _diff_sq=None):
     """
-    Compute omnidirectional or directional empirical semivariogram.
+    Compute omnidirectional or directional empirical semivariogram
+    using GSLIB-style lag binning (lag separation + lag tolerance).
 
     Lag parameters are **adaptive by default**.  If none of n_lags /
     max_lag / lag_width / max_lag_frac are given, the function calls
     ``auto_lag_params`` to choose values based on point density and
     domain extent.  You can override any subset; the rest will be
     inferred consistently.
+
+    Binning (GSLIB convention): lag *centers* sit at
+    ``lag_width * (k + 0.5)`` for k = 0..n_lags-1, and a point pair at
+    separation ``d`` contributes to lag k when
+    ``|d - center_k| <= lag_tolerance``.  With the default
+    ``lag_tolerance = lag_width / 2`` the windows are contiguous and
+    non-overlapping (edges 0, w, 2w, ...), identical to classic
+    edge-based binning.  A larger tolerance overlaps adjacent windows
+    (smoother variogram); a smaller one leaves gaps between them.
 
     Parameters
     ----------
@@ -123,9 +135,17 @@ def compute_empirical_variogram(X, y, n_lags=None, max_lag=None,
     n_lags : int or None
         Number of lag bins.  Auto-determined if None.
     max_lag : float or None
-        Maximum lag distance (m).  Auto-determined if None.
+        Maximum lag distance / reach (m).  Auto-determined if None.
+        Ignored when both n_lags and lag_width are given (then
+        ``max_lag = n_lags * lag_width``).
     lag_width : float or None
-        Width of each lag bin (m).  Auto-determined if None.
+        Lag separation = width of each lag bin (m).  Auto-determined
+        if None.  When given together with n_lags, this drives the
+        binning and ``max_lag`` is derived as ``n_lags * lag_width``.
+    lag_tolerance : float or None
+        ± window (m) around each lag center.  Defaults to
+        ``lag_width / 2`` (contiguous bins).  Larger = overlapping /
+        smoother; smaller = gaps between bins.
     max_lag_frac : float or None
         LEGACY fallback: max lag as fraction of max pairwise distance.
         Only used when max_lag is None AND auto mode is overridden by
@@ -139,7 +159,7 @@ def compute_empirical_variogram(X, y, n_lags=None, max_lag=None,
     -------
     dict with keys:
         lags, semivariance, n_pairs  (arrays, length n_lags)
-        lag_width, max_lag           (scalars)
+        lag_width, max_lag, lag_tolerance  (scalars)
         auto_params                  (dict, from auto_lag_params)
     If directional, returns list of such dicts (one per direction).
     """
@@ -151,11 +171,15 @@ def compute_empirical_variogram(X, y, n_lags=None, max_lag=None,
     # ---- Resolve lag parameters adaptively ----
     ap = auto_lag_params(X)  # always compute for reporting
 
-    if n_lags is None and max_lag is None and lag_width is None and max_lag_frac is None:
+    if (n_lags is None and max_lag is None and lag_width is None
+            and max_lag_frac is None):
         # Full auto mode
         n_lags   = ap["n_lags"]
         max_lag  = ap["max_lag"]
         lag_width = ap["lag_width"]
+    elif n_lags is not None and lag_width is not None:
+        # GSLIB-style: lag separation drives the binning, reach is derived.
+        max_lag = n_lags * lag_width
     else:
         # Partial override
         dists_tmp = pdist(X)
@@ -172,19 +196,26 @@ def compute_empirical_variogram(X, y, n_lags=None, max_lag=None,
             n_lags   = ap["n_lags"]
             lag_width = max_lag / n_lags
 
-    lag_edges = np.linspace(0, max_lag, n_lags + 1)
-    lag_centers = 0.5 * (lag_edges[:-1] + lag_edges[1:])
+    # Lag tolerance: default half-width = contiguous, non-overlapping bins.
+    if lag_tolerance is None:
+        lag_tolerance = lag_width / 2.0
 
-    # Pairwise distances & squared differences
-    dists = squareform(pdist(X))
+    # GSLIB-style centers: lag_width * (k + 0.5). With tolerance = lag_width/2
+    # the windows reproduce edge-based bins (0, w], (w, 2w], ... exactly.
+    lag_centers = lag_width * (np.arange(n_lags) + 0.5)
+
+    # Pairwise distances & squared differences (allow precomputed reuse —
+    # the same N×N arrays are needed by every candidate during the lag search).
+    dists = squareform(pdist(X)) if _dists is None else _dists
     n = len(y)
-    diff_sq = np.subtract.outer(y, y) ** 2
+    diff_sq = np.subtract.outer(y, y) ** 2 if _diff_sq is None else _diff_sq
 
     def _compute_bins(angle_mask=None):
         semivar = np.zeros(n_lags)
         counts = np.zeros(n_lags, dtype=int)
         for k in range(n_lags):
-            lo, hi = lag_edges[k], lag_edges[k + 1]
+            lo = lag_centers[k] - lag_tolerance
+            hi = lag_centers[k] + lag_tolerance
             mask = (dists > lo) & (dists <= hi)
             if angle_mask is not None:
                 mask &= angle_mask
@@ -197,6 +228,7 @@ def compute_empirical_variogram(X, y, n_lags=None, max_lag=None,
     base_result = {
         "lag_width": lag_width,
         "max_lag": max_lag,
+        "lag_tolerance": lag_tolerance,
         "auto_params": ap,
     }
 

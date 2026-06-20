@@ -517,6 +517,16 @@ def run_pipeline():
                       if mode == "kriging" else None)
     kriging_nlags  = (engine_cfg.get("kriging", {}).get("n_lags", 12)
                       if mode == "kriging" else 12)
+    kriging_max_lag = (engine_cfg.get("kriging", {}).get("max_lag", None)
+                       if mode == "kriging" else None)
+    kriging_lag_width = (engine_cfg.get("kriging", {}).get("lag_width", None)
+                         if mode == "kriging" else None)
+    kriging_lag_tol = (engine_cfg.get("kriging", {}).get("lag_tolerance", None)
+                       if mode == "kriging" else None)
+    kriging_lock_nl = (engine_cfg.get("kriging", {}).get("lock_n_lags", True)
+                       if mode == "kriging" else True)
+    kriging_lock_ml = (engine_cfg.get("kriging", {}).get("lock_max_lag", True)
+                       if mode == "kriging" else True)
     gp_preset      = (engine_cfg.get("gp", {}).get("preset_params")
                       if mode == "gp" else None)
 
@@ -540,7 +550,12 @@ def run_pipeline():
             X, Z_fit,
             model_name=kriging_model,
             n_lags=kriging_nlags,
+            max_lag=kriging_max_lag if kriging_max_lag else None,
+            lag_width=kriging_lag_width if kriging_lag_width else None,
+            lag_tolerance=kriging_lag_tol if kriging_lag_tol else None,
             n_folds=engine_cfg.get("kriging", {}).get("n_splits", 5),
+            lock_n_lags=kriging_lock_nl,
+            lock_max_lag=kriging_lock_ml,
             compute_cv=engine_cfg.get("kriging", {}).get("compute_cv", False),
         )
     elif gp_preset:

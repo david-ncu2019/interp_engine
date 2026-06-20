@@ -133,6 +133,11 @@ def build_config(state: dict) -> dict:
             "n_splits":       int(state.get("kriging_n_splits", 3)),
             "n_trials":       int(state.get("kriging_n_trials", 300)),
             "n_lags":         int(state.get("kriging_n_lags", 12)),
+            "max_lag":        float(state.get("kriging_max_lag", 0.0)),
+            "lag_width":      float(state.get("kriging_lag_width", 0.0)),
+            "lag_tolerance":  float(state.get("kriging_lag_tol", 0.0)),
+            "lock_n_lags":    bool(state.get("kriging_lock_n_lags", True)),
+            "lock_max_lag":   bool(state.get("kriging_lock_max_lag", False)),
             "compute_cv":     bool(state.get("compute_cv", False)),
         }
         if state.get("kriging_model"):
