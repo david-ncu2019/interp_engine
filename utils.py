@@ -627,8 +627,16 @@ def perform_kriging_kfold_cv(ak_model, X, y, n_folds=5, seed=42, nst=None):
                 fold_psill  = float(max(_params[1], 1e-6))
                 fold_bp["nugget"] = fold_nugget
                 fold_bp["psill"]  = fold_psill
+        except ImportError:
+            import warnings as _w
+            _w.warn(
+                "skgstat is not installed — per-fold nugget re-estimation "
+                "skipped. CV uses global nugget for all folds. "
+                "Install with: pip install scikit-gstat",
+                UserWarning, stacklevel=2,
+            )
         except Exception:
-            # If skgstat is unavailable or the fit fails, fall back to global
+            # Fit failed — fall back to global parameters silently
             pass
         # ──────────────────────────────────────────────────────────────────
 

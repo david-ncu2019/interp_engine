@@ -314,6 +314,12 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y, dtype=np.float64)
 
+        if len(X) < 4:
+            raise ValueError(
+                f"Kriging requires at least 4 data points to fit a variogram "
+                f"and solve the kriging system. Got {len(X)} points."
+            )
+
         data_var = max(float(np.var(y)), 1e-12)
         max_dist = float(np.sqrt((X[:, 0].max() - X[:, 0].min())**2 +
                                   (X[:, 1].max() - X[:, 1].min())**2))
@@ -359,6 +365,23 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
             best_nl, best_ml = n_lags, (max_lag_auto if max_lag is None else max_lag)
             fold_ids = _msbf(X, n_folds) if n_folds > 1 else np.zeros(len(X), dtype=int)
 
+            # Precompute per-fold distance matrices for the inline CV.
+            # During lag search anisotropy is identity (angle=0, scaling=1),
+            # so raw-coordinate distances are correct and reusable across all
+            # (n_lags, max_lag) candidates.  This avoids ~n_candidates × n_folds
+            # redundant cdist calls inside _quick_cv_rmss.
+            from scipy.spatial.distance import cdist
+            _fold_dists = {}
+            for fold in range(n_folds):
+                tr_idx = np.where(fold_ids != fold)[0]
+                te_idx = np.where(fold_ids == fold)[0]
+                if len(tr_idx) < 10 or len(te_idx) < 3:
+                    continue
+                _fold_dists[fold] = (
+                    cdist(X[tr_idx], X[tr_idx]),
+                    cdist(X[te_idx], X[tr_idx]),
+                )
+
             print(f"       [fast-opt] Searching lag params: "
                   f"n_lags={'unlocked' if not lock_n_lags else 'locked='+str(n_lags)}, "
                   f"max_lag={'unlocked' if not lock_max_lag else 'locked'}",
@@ -393,7 +416,8 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
 
                     # Quick inline CV — compute RMSS
                     rmss_val = self._quick_cv_rmss(
-                        X, y, model_name, wls_res, fold_ids, n_folds)
+                        X, y, model_name, wls_res, fold_ids, n_folds,
+                        fold_dists=_fold_dists)
                     if rmss_val is None:
                         continue
 
@@ -413,6 +437,16 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
                 max_lag = best_ml
             print(f"       [fast-opt] Lag search done: n_lags={best_nl}, "
                   f"max_lag={best_ml:.1f}, score={best_score:.4f}", flush=True)
+
+            if best_score == float('inf'):
+                import warnings as _w
+                _w.warn(
+                    "Lag parameter search found zero valid (n_lags, max_lag) "
+                    "candidates. Falling back to defaults. Consider unlocking "
+                    "both n_lags and max_lag, or providing a dataset with "
+                    "more spatial structure.",
+                    UserWarning, stacklevel=2,
+                )
 
         # ── Stage 1: Empirical variogram + initial estimates ─────────────────
         # When lag distance is unlocked the search has chosen max_lag; do NOT also pass
@@ -565,7 +599,9 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
             t3 = _time.perf_counter()
 
             dir_result = compute_empirical_variogram(
-                X_emp, y_emp, n_lags=n_lags, directions=[0, 45, 90, 135],
+                X_emp, y_emp, n_lags=n_lags,
+                directions=[0, 22.5, 45, 67.5, 90, 112.5, 135, 157.5],
+                tol_angle=11.25,  # contiguous bins at 22.5° steps
                 _dists=_dists_cache, _diff_sq=_diff_sq_cache,
             )
 
@@ -812,12 +848,17 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
             result['alpha'] = float(best_params[3])
         return result
 
-    def _quick_cv_rmss(self, X, y, model_name, wls_params, fold_ids, n_folds):
+    def _quick_cv_rmss(self, X, y, model_name, wls_params, fold_ids, n_folds,
+                        fold_dists=None):
         """Quick inline CV to compute RMSS for a candidate fit.
         Returns RMSS or None on failure.
 
         Uses fast_kriging.ok_predict (lu_factor + batched lu_solve) instead of
         PyKrige's `inv`-per-fold path. ~3-4x faster, byte-equivalent results.
+
+        When `fold_dists` is provided (dict mapping fold → (D_tr, D_te)), the
+        precomputed pairwise distance matrices are reused, skipping redundant
+        cdist calls across candidates in the lag-search loop.
         """
         try:
             psill = wls_params['psill']
@@ -841,9 +882,14 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
             if len(tr_idx) < 10 or len(te_idx) < 3:
                 continue
             try:
+                if fold_dists is not None and fold in fold_dists:
+                    D_tr, D_te = fold_dists[fold]
+                else:
+                    D_tr = D_te = None
                 mean, std = ok_predict(
                     X[tr_idx], y[tr_idx], X[te_idx],
-                    model_name, params, return_std=True)
+                    model_name, params, return_std=True,
+                    D_tr=D_tr, D_te=D_te)
                 resid = y[te_idx] - mean
                 z_sq = (resid / np.maximum(std, 1e-10)) ** 2
                 z_scores.extend(z_sq.tolist())
