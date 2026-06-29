@@ -20,7 +20,8 @@ warnings.filterwarnings("ignore")
 # 1. EMPIRICAL VARIOGRAM
 # ========================================================================
 
-def auto_lag_params(X, min_pairs_per_bin=30, min_lags=6, max_lags=30):
+def auto_lag_params(X, min_pairs_per_bin=30, min_lags=6, max_lags=30,
+                    max_dist=None, median_nn=None):
     """
     Determine adaptive variogram lag parameters from data geometry.
 
@@ -39,6 +40,10 @@ def auto_lag_params(X, min_pairs_per_bin=30, min_lags=6, max_lags=30):
     min_pairs_per_bin : int – target minimum pair count per lag bin
     min_lags : int – hard lower bound on lag count
     max_lags : int – hard upper bound on lag count
+    max_dist : float or None – precomputed max pairwise distance (skips pdist)
+    median_nn : float or None – precomputed median NN distance (skips pdist)
+        When both max_dist and median_nn are provided, the internal pdist call
+        is skipped entirely.
 
     Returns
     -------
@@ -51,13 +56,18 @@ def auto_lag_params(X, min_pairs_per_bin=30, min_lags=6, max_lags=30):
     n = len(X)
     n_total_pairs = n * (n - 1) // 2
 
-    dists_sq = squareform(pdist(X))
-    max_dist = dists_sq.max()
+    if max_dist is not None and median_nn is not None:
+        # Both provided by caller who already has a distance matrix —
+        # skip the O(N²) pdist call entirely.
+        pass
+    else:
+        dists_sq = squareform(pdist(X))
+        max_dist = dists_sq.max()
 
-    # Nearest-neighbour distances (excluding self)
-    np.fill_diagonal(dists_sq, np.inf)
-    nn_dists = dists_sq.min(axis=1)
-    median_nn = float(np.median(nn_dists))
+        # Nearest-neighbour distances (excluding self)
+        np.fill_diagonal(dists_sq, np.inf)
+        nn_dists = dists_sq.min(axis=1)
+        median_nn = float(np.median(nn_dists))
 
     notes = []
 
@@ -169,7 +179,15 @@ def compute_empirical_variogram(X, y, n_lags=None, max_lag=None,
     y = np.asarray(y, dtype=np.float64)
 
     # ---- Resolve lag parameters adaptively ----
-    ap = auto_lag_params(X)  # always compute for reporting
+    if _dists is not None:
+        # Reuse caller's precomputed distance matrix to avoid a redundant
+        # O(N²) pdist inside auto_lag_params.
+        _d = _dists.copy()
+        np.fill_diagonal(_d, np.inf)
+        ap = auto_lag_params(X, max_dist=float(_dists.max()),
+                             median_nn=float(np.median(_d.min(axis=1))))
+    else:
+        ap = auto_lag_params(X)
 
     if (n_lags is None and max_lag is None and lag_width is None
             and max_lag_frac is None):
@@ -269,7 +287,7 @@ def gaussian_model(h, psill, a, nugget):
 
 def plot_variogram(vario_dict, true_params=None, fitted_params=None,
                    engine_name="", scenario_name="", save_path=None,
-                   fig=None):
+                   fig=None, model_evaluator=None):
     """
     Publication-quality variogram plot with empirical points, pair counts,
     and optional fitted/true model curves.
@@ -278,10 +296,14 @@ def plot_variogram(vario_dict, true_params=None, fitted_params=None,
     ----------
     vario_dict : dict from compute_empirical_variogram (omnidirectional)
     true_params : dict  {psill, range_major, nugget}   (ground truth)
-    fitted_params : dict {psill, range, nugget}         (engine recovered)
+    fitted_params : dict {psill, range, nugget, best_model} (engine recovered)
     fig : optional matplotlib Figure to draw onto (UI embedding). When given,
           the figure is cleared and reused, and it is NOT closed (caller owns
           it). When None, a new pyplot figure is created and closed as before.
+    model_evaluator : callable(h, psill, range, nugget, alpha=None) or None
+          The actual fitted variogram model function. When provided, it is
+          used for the "Fitted" curve instead of the hardcoded Gaussian model.
+          When None, falls back to gaussian_model for backward compatibility.
     """
     lags = vario_dict["lags"]
     sv = vario_dict["semivariance"]
@@ -309,9 +331,21 @@ def plot_variogram(vario_dict, true_params=None, fitted_params=None,
         ax1.plot(h_fine, y_true, "b-", lw=2, label="True model")
 
     if fitted_params is not None:
-        y_fit = gaussian_model(h_fine, fitted_params.get("psill", 1),
-                               fitted_params.get("range", 200),
-                               fitted_params.get("nugget", 0))
+        if model_evaluator is not None:
+            # Use the actual fitted model, not hardcoded Gaussian
+            _psill = fitted_params.get("psill", 1)
+            _rng = fitted_params.get("range", 200)
+            _nugget = fitted_params.get("nugget", 0)
+            _alpha = fitted_params.get("alpha", None)
+            if _alpha is not None:
+                y_fit = model_evaluator(h_fine, _psill, _rng, _nugget, _alpha)
+            else:
+                y_fit = model_evaluator(h_fine, _psill, _rng, _nugget)
+        else:
+            # Backward-compatible fallback: Gaussian model
+            y_fit = gaussian_model(h_fine, fitted_params.get("psill", 1),
+                                   fitted_params.get("range", 200),
+                                   fitted_params.get("nugget", 0))
         ax1.plot(h_fine, y_fit, "g--", lw=2, label=f"Fitted ({engine_name})")
 
     ax1.set_ylabel("Semivariance", fontsize=12)

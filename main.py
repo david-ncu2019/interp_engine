@@ -44,7 +44,7 @@ from src.data_loader import load_input_data, load_custom_prediction_points
 from src.geometry import generate_prediction_grid
 from src.exporter import export_grid, _VALID_POINT_FORMATS
 from src.engines.gp import RotatedGPR
-from src.engines.kriging import AnisotropicKriging
+from src.engines.kriging import AnisotropicKriging, VARIOGRAM_EVALUATORS
 from src.preprocessor import TrendProcessor, analyze_trend, NormalScoreTransform
 from utils import (
     compute_empirical_variogram,
@@ -679,12 +679,17 @@ def run_pipeline():
         omni_var = compute_empirical_variogram(
             X, Z_fit, n_lags=kriging_nlags if mode == "kriging" else None,
             _dists=_dists_diag)
+        # Resolve the actual fitted model evaluator for the diagnostic plot
+        # (instead of always showing a Gaussian curve).
+        _model_name = params.get("best_model", "spherical")
+        _evaluator = VARIOGRAM_EVALUATORS.get(_model_name)
         plot_variogram(
             omni_var,
             fitted_params=params,
             engine_name=mode.upper(),
             scenario_name=scenario_name,
             save_path=out_dir / f"D_variogram_omni_{mode}.png",
+            model_evaluator=_evaluator,
         )
         print(f"       ✓ D_variogram_omni_{mode}.png")
 
