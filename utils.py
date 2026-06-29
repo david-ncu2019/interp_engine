@@ -16,6 +16,47 @@ from sklearn.base import clone
 warnings.filterwarnings("ignore")
 
 
+def nst_backtransform_std(nst, means, stds, n_samples=200, seed=42):
+    """Back-transform kriging std through NST inverse via Monte Carlo.
+
+    The finite-difference approximation (dnst via ±delta) produces
+    nonsensical values near the edges of the training-data range where
+    the NST inverse extrapolation clips.  A quantile-based Monte Carlo
+    approach is more robust: sample from the Normal distribution at each
+    prediction point, inverse-transform all samples, then compute the
+    empirical standard deviation.
+
+    Parameters
+    ----------
+    nst : NormalScoreTransform
+    means : (m,) array — predictions in normal-score space
+    stds : (m,) array — kriging std in normal-score space
+    n_samples : int — Monte Carlo samples per point (default 200)
+    seed : int — RNG seed for reproducibility
+
+    Returns
+    -------
+    means_out : (m,) array — means in original units
+    stds_out : (m,) array — stds in original units
+    """
+    rng = np.random.default_rng(seed)
+    m = len(means)
+
+    # Sample from N(mean, std²) at each prediction point
+    samples_ns = means[:, None] + stds[:, None] * rng.normal(size=(m, n_samples))
+
+    # Inverse-transform all samples to original space
+    samples_orig = np.empty_like(samples_ns)
+    for i in range(m):
+        samples_orig[i] = nst.inverse_transform(samples_ns[i])
+
+    # Mean and std from the empirical distribution of back-transformed samples
+    means_out = np.mean(samples_orig, axis=1)
+    stds_out = np.std(samples_orig, axis=1, ddof=1)
+
+    return means_out, stds_out
+
+
 # ========================================================================
 # 1. EMPIRICAL VARIOGRAM
 # ========================================================================
@@ -527,15 +568,8 @@ def perform_gpr_kfold_cv(rgpr_model, X, y, n_folds=5, seed=42, nst=None):
         # that CV metrics are always in the original data domain.
         if nst is not None:
             obs_bt  = nst.inverse_transform(y_te)
-            pred_bt = nst.inverse_transform(pred)
-            # Propagate std through the nonlinear inverse: finite-difference
-            # derivative dx/dz evaluated at the predicted normal-score value.
-            delta   = 0.01
-            dnst    = 0.5 * np.abs(
-                nst.inverse_transform(pred + delta) -
-                nst.inverse_transform(pred - delta)
-            ) / delta
-            std_bt  = dnst * std
+            pred_bt, std_bt = nst_backtransform_std(nst, pred, std)
+            obs_bt = nst.inverse_transform(y_te)
         else:
             obs_bt, pred_bt, std_bt = y_te, pred, std
 

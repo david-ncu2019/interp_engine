@@ -48,6 +48,7 @@ from src.engines.kriging import AnisotropicKriging, VARIOGRAM_EVALUATORS
 from src.preprocessor import TrendProcessor, analyze_trend, NormalScoreTransform
 from utils import (
     compute_empirical_variogram,
+    nst_backtransform_std,
     plot_variogram,
     plot_directional_variogram,
     plot_anisotropy_ellipse,
@@ -67,6 +68,9 @@ from utils import (
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
+
+
+# ── pipeline ───────────────────────────────────────────────────────────────
 
 def load_config(filepath: str) -> dict:
     """Load YAML configuration file."""
@@ -619,15 +623,11 @@ def run_pipeline():
         # Order matters: NST was applied to the detrended residuals, so NST
         # inverse must come before re-trending.
         if nst is not None:
-            # std is in normal-score units; approximate back-transform via
-            # finite-difference of the NST inverse *before* means is overwritten.
-            delta = 0.01
-            dnst  = 0.5 * np.abs(
-                nst.inverse_transform(means + delta) -
-                nst.inverse_transform(means - delta)
-            ) / delta          # local derivative dx/dz at each prediction point
-            means = nst.inverse_transform(means)
-            stds  = dnst * stds   # propagate std through the nonlinear transform
+            # Back-transform means and stds through NST inverse using
+            # Monte Carlo sampling.  More robust than the finite-difference
+            # approximation (dnst via ±delta) near the edges of the
+            # training-data distribution where the NST inverse clips.
+            means, stds = nst_backtransform_std(nst, means, stds)
         if processor is not None:
             means = processor.retrend(valid_points[:, 0], valid_points[:, 1], means)
             
