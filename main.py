@@ -166,7 +166,10 @@ def check_and_clean_duplicates(
     X = np.asarray(X, dtype=np.float64)
     Z = np.asarray(Z, dtype=np.float64)
 
-    dist_mat = squareform(pdist(X))
+    # Pairwise distance matrix computed ONCE for exact-duplicate detection.
+    # After exact duplicates are merged and removed (N shrinks), we recompute
+    # for near-duplicate detection — but that pdist is cheaper with fewer points.
+    _dist_exact = squareform(pdist(X))
 
     # ── Step 1: merge exact duplicates (distance == 0) ────────────────────────
     # Build clusters of co-located points iteratively.
@@ -177,7 +180,7 @@ def check_and_clean_duplicates(
     for i in range(len(X)):
         if visited[i]:
             continue
-        exact_group = np.where(dist_mat[i] == 0.0)[0]
+        exact_group = np.where(_dist_exact[i] == 0.0)[0]
         if len(exact_group) > 1:
             # Replace the first occurrence with the group mean; discard the rest
             Z[exact_group[0]] = np.mean(Z[exact_group])
@@ -189,15 +192,19 @@ def check_and_clean_duplicates(
     Z = Z[keep_mask]
 
     # ── Step 2: jitter near-duplicates (0 < distance < min_separation) ───────
-    dist_mat2 = squareform(pdist(X))
-    np.fill_diagonal(dist_mat2, np.inf)
+    # Recompute on deduplicated coordinates (usually fewer points than Step 1).
+    if len(X) > 1:
+        _dist_near = squareform(pdist(X))
+    else:
+        _dist_near = np.zeros((len(X), len(X)))
+    np.fill_diagonal(_dist_near, np.inf)
 
     rng         = np.random.default_rng(42)
     jitter_mag  = min_separation / 10.0
     jitter_mask = np.zeros(len(X), dtype=bool)
 
     for i in range(len(X)):
-        if np.any(dist_mat2[i] < min_separation):
+        if np.any(_dist_near[i] < min_separation):
             jitter_mask[i] = True
 
     n_near = int(jitter_mask.sum())
@@ -265,12 +272,16 @@ def run_pipeline():
     # This step merges exact duplicates (taking the mean value) and
     # jitters near-duplicates to enforce a minimum separation distance.
     dup_cfg = config.get("preprocessing", {}).get("duplicates", {})
-    # Compute default min_separation from data geometry if not set in config
-    from scipy.spatial.distance import pdist as _pdist_dup, squareform as _sq_dup
-    _d_dup = _sq_dup(_pdist_dup(X))
-    np.fill_diagonal(_d_dup, np.inf)
-    _median_nn_dup = float(np.median(_d_dup.min(axis=1)))
-    default_sep = max(_median_nn_dup * 0.1, 1e-3)
+    # Compute data-geometry statistics from the pairwise distance matrix ONCE.
+    # The same max_dist and median_nn are reused for min_sep default (here),
+    # GP length-scale bounds, and post-fit diagnostic variograms, avoiding
+    # 3 additional O(N²) pdist calls downstream.
+    from scipy.spatial.distance import pdist as _pdist_main, squareform as _sq_main
+    _dists_full = _sq_main(_pdist_main(X))
+    np.fill_diagonal(_dists_full, np.inf)
+    _pipeline_median_nn = float(np.median(_dists_full.min(axis=1)))
+    _pipeline_max_dist = float(_dists_full.max())
+    default_sep = max(_pipeline_median_nn * 0.1, 1e-3)
     min_sep = dup_cfg.get("min_separation", None) or default_sep
 
     X, Z_val, dup_report = check_and_clean_duplicates(X, Z_val, min_separation=min_sep)
@@ -454,12 +465,10 @@ def run_pipeline():
         #            (beyond this, all points are globally correlated → no info)
         #
         # The user can still override with explicit config keys if desired.
-        from scipy.spatial.distance import pdist, squareform as _squareform
-        _dists_sq = _squareform(pdist(X))
-        np.fill_diagonal(_dists_sq, np.inf)
-        _median_nn = float(np.median(_dists_sq.min(axis=1)))
-        np.fill_diagonal(_dists_sq, 0.0)
-        _max_dist  = float(_dists_sq.max())
+        # Reuse pipeline-level distance statistics computed once at [1/7] entry
+        # (avoids a redundant O(N²) pdist call here).
+        _median_nn = _pipeline_median_nn
+        _max_dist  = _pipeline_max_dist
 
         ls_min_auto = max(_median_nn * 0.5, 1e-3)
         ls_max_auto = _max_dist * 0.6
@@ -661,8 +670,15 @@ def run_pipeline():
         print("       ✓ C_trend_components.png")
 
     if out_cfg.get("save_diagnostics", True):
+        # Precompute the distance matrix once for both omni and directional
+        # diagnostic variograms (avoids a second redundant pdist inside
+        # compute_empirical_variogram).
+        _dists_diag = _sq_main(_pdist_main(X))
+
         # D_ Omnidirectional variogram
-        omni_var = compute_empirical_variogram(X, Z_fit, n_lags=kriging_nlags if mode == "kriging" else None)
+        omni_var = compute_empirical_variogram(
+            X, Z_fit, n_lags=kriging_nlags if mode == "kriging" else None,
+            _dists=_dists_diag)
         plot_variogram(
             omni_var,
             fitted_params=params,
@@ -674,7 +690,8 @@ def run_pipeline():
 
         # E_ Directional variogram (15° intervals)
         directions = np.arange(0, 180, 15)
-        dir_vars = compute_empirical_variogram(X, Z_fit, directions=directions)
+        dir_vars = compute_empirical_variogram(
+            X, Z_fit, directions=directions, _dists=_dists_diag)
         plot_directional_variogram(
             dir_vars,
             scenario_name=scenario_name,
