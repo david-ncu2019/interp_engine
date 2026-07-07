@@ -320,6 +320,36 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
                 f"and solve the kriging system. Got {len(X)} points."
             )
 
+        # ── Pre-fit diagnostics ────────────────────────────────────────────
+        from scipy.stats import skew as _skew
+        _y_skew = float(_skew(y))
+        if abs(_y_skew) > 2.0:
+            print(
+                f"   NOTE: Data is highly skewed (skewness={_y_skew:+.1f}). "
+                f"The empirical variogram uses squared differences and is "
+                f"sensitive to extreme values.",
+                flush=True,
+            )
+            print(
+                f"         Strongly recommended: enable Normal Score "
+                f"Transform (NST) or apply a log-transform before kriging.",
+                flush=True,
+            )
+
+        if len(X) < 50:
+            _level = "WARNING" if len(X) < 30 else "NOTE"
+            print(
+                f"   {_level}: Only {len(X)} data points. "
+                f"The empirical variogram will be noisy.",
+                flush=True,
+            )
+            if len(X) < 30:
+                print(
+                    f"          At least 50-100 points are recommended for "
+                    f"reliable variogram fitting.",
+                    flush=True,
+                )
+
         data_var = max(float(np.var(y)), 1e-12)
         max_dist = float(np.sqrt((X[:, 0].max() - X[:, 0].min())**2 +
                                   (X[:, 1].max() - X[:, 1].min())**2))
@@ -682,6 +712,32 @@ class AnisotropicKriging(BaseEstimator, RegressorMixin):
         }
         if has_alpha:
             self.best_params_['alpha'] = opt_alpha
+
+        # ── Post-fit quality check ─────────────────────────────────────────
+        _nug = float(self.best_params_.get('nugget', 0.0))
+        _psill = float(self.best_params_.get('psill', 1.0))
+        # Use nugget/psill (partial sill ratio): > 0.8 means the variogram
+        # signal-to-noise ratio is < 0.25, i.e. mostly noise.
+        _nug_ratio = _nug / _psill if _psill > 1e-12 else 1.0
+        if _nug_ratio > 0.8:
+            print(
+                f"   WARNING: Nugget/psill ratio is {_nug_ratio:.2f}. "
+                f"The variogram shows very weak spatial structure "
+                f"(signal-to-noise ratio = {1/_nug_ratio if _nug_ratio > 0 else float('inf'):.1f}).",
+                flush=True,
+            )
+            print(
+                f"            The kriging prediction will be close to the "
+                f"global mean with large uncertainty everywhere.",
+                flush=True,
+            )
+            print(
+                f"            Likely causes: (a) data is highly skewed — try "
+                f"enabling Normal Score Transform, (b) data has no spatial "
+                f"correlation, (c) too few data points (N={len(X)}) for "
+                f"reliable variogram estimation.",
+                flush=True,
+            )
 
         # Optional CV check for quality reporting. This is the only O(N^3) work in the
         # pipeline (it builds + solves a kriging system per fold), and it is NOT needed
