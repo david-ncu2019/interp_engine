@@ -214,12 +214,13 @@ class WorkspaceController(QObject):
         self._proc.waitForFinished(500)
         self._auto_fit_dir = tempfile.mkdtemp(prefix="autoopt_", dir=str(_TEMP_ROOT))
         state = dict(self._state)
-        # Auto-fit MUST run in raw space so returned params match the
-        # raw empirical variogram and sliders (NST/detrend transforms
-        # would change the units of psill/nugget/range).
+        # Detrend is kept off during auto-fit so returned params match the
+        # raw-space sliders. NST however is respected: when the user enables
+        # NST (recommended for highly skewed data like contamination), the
+        # fit runs in normal-score space and returned params are in NST units.
         state["detrend_enabled"] = False
         state["detrend_auto"] = False
-        state["nst_enabled"] = False
+        # nst_enabled flows through from the UI combo box (Off/On/Auto)
         # Optimization reports params, not CV metrics — force CV off so the
         # default optimize path stays fast regardless of the CV checkbox.
         state["compute_cv"] = False
