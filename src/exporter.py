@@ -49,8 +49,22 @@ def export_to_netcdf(
         },
     )
 
-    ds.to_netcdf(out_path)
-    print(f"       ✓ predicted_{engine_name}.nc")
+    # netCDF4 can fail on some Windows conda environments due to DLL PATH
+    # contamination (MKL/OpenMP conflicts across envs).  Catch the error
+    # gracefully so the user still gets their PNG diagnostics and can re-run
+    # with a working netCDF4 env or use a different export format.
+    try:
+        import tempfile, os as _os
+        tmp = tempfile.NamedTemporaryFile(
+            suffix='.nc', delete=False, dir=str(output_dir))
+        tmp.close()
+        ds.to_netcdf(tmp.name)
+        _os.replace(tmp.name, str(out_path))
+        print(f"       ✓ predicted_{engine_name}.nc")
+    except PermissionError:
+        print(f"       ⚠ NetCDF export skipped — file permission error "
+              f"(common on Windows with cross-env DLL conflicts). "
+              f"PNG diagnostics are still available.")
 
 
 def export_to_geotiff(

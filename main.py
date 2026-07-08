@@ -282,9 +282,11 @@ def run_pipeline():
     # 3 additional O(N²) pdist calls downstream.
     from scipy.spatial.distance import pdist as _pdist_main, squareform as _sq_main
     _dists_full = _sq_main(_pdist_main(X))
+    # Compute max_dist BEFORE filling diagonal with inf (needed for median NN).
+    # Otherwise _dists_full.max() returns inf, breaking GP length-scale bounds.
+    _pipeline_max_dist = float(_dists_full.max())
     np.fill_diagonal(_dists_full, np.inf)
     _pipeline_median_nn = float(np.median(_dists_full.min(axis=1)))
-    _pipeline_max_dist = float(_dists_full.max())
     default_sep = max(_pipeline_median_nn * 0.1, 1e-3)
     min_sep = dup_cfg.get("min_separation", None) or default_sep
 
